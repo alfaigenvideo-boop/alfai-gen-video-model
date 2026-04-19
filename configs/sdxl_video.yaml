@@ -1,0 +1,12 @@
+model:
+  scheduler:
+    type: "euler_ancestral"  # Kullanılacak sampler tipi
+  
+  generation:
+    width: 1024
+    height: 576
+    num_frames: 24           # Toplam kare sayısı
+    fps: 8                   # Saniyedeki kare sayısı
+    steps: 30                # Inference adım sayısı (kaliteyi artırır)
+    guidance_scale: 7.5      # Prompt'a ne kadar sadık kalacağı
+    negative_prompt: "low quality, distortion, watermark, text, blurry, ugly"

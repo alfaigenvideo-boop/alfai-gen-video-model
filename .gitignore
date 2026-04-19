@@ -1,0 +1,6 @@
+__pycache__/
+.vscode/
+outputs/
+models/
+*.safetensors
+*.pth

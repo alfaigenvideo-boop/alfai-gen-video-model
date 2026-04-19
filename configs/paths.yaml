@@ -1,0 +1,14 @@
+paths:
+  base_dir: "/home/hpc/Desktop/sdxl-video-generator"
+  
+  models:
+    sdxl_base: "${paths.base_dir}/models/sdxl/base/minimal/sd_xl_base_1.0.safetensors"
+    sdxl_vae: "${paths.base_dir}/models/sdxl_vae/minimal/sdxl_vae.safetensors"
+    # İleride eklenecekler için yer tutucular
+    ip_adapter: "${paths.base_dir}/models/ip_adapter/"
+    controlnet: "${paths.base_dir}/models/controlnet/"
+
+  output:
+    videos: "${paths.base_dir}/outputs/videos/"
+    images: "${paths.base_dir}/outputs/images/"
+    logs: "${paths.base_dir}/logs/"

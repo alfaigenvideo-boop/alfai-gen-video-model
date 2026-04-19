@@ -1,0 +1,8 @@
+runtime:
+  device: "cuda"          # "cuda" veya "cpu"
+  precision: "fp16"       # "fp16" (hızlı/az vram) veya "fp32" (yüksek kalite)
+  seed: 42                # Sabit seed (tekrarlanabilirlik için), rastgele için null bırak
+  
+  # Bellek Yönetimi
+  enable_model_cpu_offload: true   # VRAM yetmezse modeli RAM'e taşır (yavaşlatır ama çalıştırır)
+  flush_vram_after_generation: true # Her üretimden sonra VRAM'i temizle
