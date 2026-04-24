@@ -14,6 +14,12 @@ from pipelines.frame_generator import generate_next_frame
 from modules.flow.flow_factory import build_flow
 from modules.losses.loss_functions import build_loss
 
+from modules.controlnet_wrapper import ControlNetWrapper
+from modules.ip_adapter_wrapper import IPAdapterWrapper
+from modules.adaptive_control.adaptive_scheduler import AdaptiveScheduler
+from modules.adaptive_control.temporal_metrics import FaceAnalyzer, CLIPScorer, TemporalMetrics
+from pipelines.frame_generator import generate_next_frame
+
 logger = logging.getLogger(__name__)
 
 class SDXLVideoPipeline(DiffusionPipeline):
@@ -36,6 +42,12 @@ class SDXLVideoPipeline(DiffusionPipeline):
         device: Optional[str] = None,
         flow_model_name: str = "raft",
         loss_config: Optional[Dict[str, Any]] = None,
+        adaptive_scheduler: AdaptiveScheduler = None,
+        controlnet: ControlNetWrapper = None,
+        ip_adapter: IPAdapterWrapper = None,
+        face_analyzer: FaceAnalyzer = None,
+        clip_scorer: CLIPScorer = None,
+        loss_module: Optional[Any] = None,
     ):
         super().__init__()
 
@@ -54,9 +66,69 @@ class SDXLVideoPipeline(DiffusionPipeline):
         
         # ✅ UPDATED: LatentWarper
         self.warper = LatentWarper(device=self.device_name)
+
+        self.adaptive_scheduler = adaptive_scheduler
+        self.controlnet = controlnet
+        self.ip_adapter = ip_adapter
+        self.face_analyzer = face_analyzer
+        self.clip_scorer = clip_scorer
+        self.loss_module = loss_module
         
         logger.info(f"SDXLVideoPipeline initialized fully on {self.device_name}")
 
+    # -------------------------------------------------
+    # TEXT ENCODING (PROMPT -> EMBEDS)
+    # -------------------------------------------------
+    def encode_prompt(self, prompt: str, device: str):
+        """Metni SDXL'in beklediği embed tensörlerine çevirir."""
+        # Eğer pipeline'a text_encoder'lar yüklenmemişse hata ver
+        if not hasattr(self, "text_encoder") or not hasattr(self, "text_encoder_2"):
+            raise ValueError("SDXL pipeline must be loaded with text_encoder and text_encoder_2")
+            
+        # 1. İlk Encoder (Base CLIP)
+        text_inputs = self.tokenizer(
+            prompt, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+        )
+        text_input_ids = text_inputs.input_ids
+        prompt_embeds = self.text_encoder(text_input_ids.to(device), output_hidden_states=True)
+        pooled_prompt_embeds = prompt_embeds[0]
+        prompt_embeds = prompt_embeds.hidden_states[-2]
+
+        # 2. İkinci Encoder (OpenCLIP - SDXL Specific)
+        text_inputs_2 = self.tokenizer_2(
+            prompt, padding="max_length", max_length=self.tokenizer_2.model_max_length, truncation=True, return_tensors="pt"
+        )
+        text_input_ids_2 = text_inputs_2.input_ids
+        prompt_embeds_2 = self.text_encoder_2(text_input_ids_2.to(device), output_hidden_states=True)
+        pooled_prompt_embeds_2 = prompt_embeds_2[0]
+        prompt_embeds_2 = prompt_embeds_2.hidden_states[-2]
+
+        # Embeddings'leri birleştir (Concat)
+        prompt_embeds = torch.cat([prompt_embeds, prompt_embeds_2], dim=-1)
+        
+        # CFG için Unconditional (Negatif) Embeddings
+        uncond_tokens = [""] # Negatif prompt boş
+        uncond_inputs = self.tokenizer(
+            uncond_tokens, padding="max_length", max_length=self.tokenizer.model_max_length, truncation=True, return_tensors="pt"
+        )
+        uncond_embeds = self.text_encoder(uncond_inputs.input_ids.to(device), output_hidden_states=True)
+        uncond_pooled = uncond_embeds[0]
+        uncond_embeds = uncond_embeds.hidden_states[-2]
+        
+        uncond_inputs_2 = self.tokenizer_2(
+            uncond_tokens, padding="max_length", max_length=self.tokenizer_2.model_max_length, truncation=True, return_tensors="pt"
+        )
+        uncond_embeds_2 = self.text_encoder_2(uncond_inputs_2.input_ids.to(device), output_hidden_states=True)
+        uncond_pooled_2 = uncond_embeds_2[0]
+        uncond_embeds_2 = uncond_embeds_2.hidden_states[-2]
+        
+        uncond_embeds = torch.cat([uncond_embeds, uncond_embeds_2], dim=-1)
+        
+        # Batch=2 yap (Uncond + Cond)
+        final_prompt_embeds = torch.cat([uncond_embeds, prompt_embeds])
+        final_pooled_embeds = torch.cat([uncond_pooled_2, pooled_prompt_embeds_2]) # SDXL uses pooled from encoder 2
+        
+        return final_prompt_embeds, final_pooled_embeds
     # -------------------------------------------------
     # LATENT → IMAGE (DECODING)
     # -------------------------------------------------
@@ -67,7 +139,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
         # MLOps FIX: UNet float16 üretiyor olabilir, ancak SDXL VAE siyah ekran
         # (NaN) hatası vermesin diye float32'de çalışır. Bu yüzden latent'i
         # decode etmeden hemen önce VAE'nin veri tipine cast ediyoruz.
-        latents = latents.to(dtype=self.vae.dtype)
+        latents = latents.to(dtype=torch.float32)
+        self.vae.to(dtype=torch.float32)
         
         latents = latents / self.vae.config.scaling_factor
         image = self.vae.decode(latents).sample
@@ -80,8 +153,12 @@ class SDXLVideoPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
+        prompt: str,
         prompt_embeds: torch.Tensor,
         added_cond_kwargs: Dict[str, Any],
+        identity_image: Image.Image,
+        pose_tensors: List[torch.Tensor],
+        depth_tensors: List[torch.Tensor],
         num_frames: int = 16,
         width: int = 1024,
         height: int = 576,
@@ -93,6 +170,9 @@ class SDXLVideoPipeline(DiffusionPipeline):
     ):
         device = self._execution_device
         video_frames: List[Image.Image] = []
+        current_scales = {"ip_scale": 0.7, "pose_scale": 1.0, "depth_scale": 1.0, "mask_threshold": 0.03}
+        prev_frame = None
+        ip_embeds = self.ip_adapter.get_image_embeds(identity_image)
 
         logger.info(f"Starting video pipeline: {num_frames} frames to be generated.")
 
@@ -134,12 +214,12 @@ class SDXLVideoPipeline(DiffusionPipeline):
         current_latents = latents
         video_frames.append(self.decode_latents(current_latents))
         logger.info("Frame 0 tamam.")
-
+        prev_frame = video_frames[0]
         # -------------------------------------------------
         # NEXT FRAMES – P FRAMES (Predictive Frames)
         # -------------------------------------------------
         for i in range(1, num_frames):
-            logger.info(f"Processing Frame {i}/{num_frames}...")
+            logger.info(f"Generating Frame {i} | Scales: {current_scales}")
 
             # 1. Önceki kareyi piksel uzayında tensöre çevirme (Flow hesaplaması için)
             prev_image_pil = video_frames[-1]
@@ -173,6 +253,11 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 mask=mask,
                 prompt_embeds=prompt_embeds,
                 added_cond_kwargs=added_cond_kwargs,
+                controlnet_wrapper=self.controlnet,
+                pose_tensor=pose_tensors[i],
+                depth_tensor=depth_tensors[i],
+                pose_scale=current_scales["pose_scale"],
+                depth_scale=current_scales["depth_scale"],
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
@@ -184,7 +269,20 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 prev_image_tensor=prev_image_tensor # ✅ YENİ: ID ve Perceptual Loss için kaynak kare
             )
 
-            video_frames.append(self.decode_latents(next_latents))
-            current_latents = next_latents
+            current_frame = self.decode_latents(next_latents)
+            video_frames.append(current_frame)
+
+            # ✅ YENİ: Sensörleri Çalıştır (Geri besleme döngüsü)
+            if self.adaptive_scheduler:
+                id_score = self.face_analyzer.similarity(identity_image, current_frame)
+                res = TemporalMetrics.compute_residual(prev_frame, current_frame)
+                clip_s = self.clip_scorer.similarity(current_frame, prompt)
+                
+                # Bir sonraki kare için yeni katsayıları hesapla
+                current_scales = self.adaptive_scheduler.step(id_score, res, clip_s)
+                # IP-Adapter scale'i anlık güncelle
+                self.ip_adapter.set_scale(current_scales["ip_scale"])
+
+            prev_frame = current_frame
 
         return type("Output", (), {"frames": video_frames})

@@ -24,6 +24,11 @@ def generate_next_frame(
     prev_image_tensor: Optional[torch.Tensor] = None,
     vae: Optional[torch.nn.Module] = None,
     loss_scale: float = 0.5,
+    controlnet_wrapper: Optional[Any] = None,
+    pose_tensor: Optional[torch.Tensor] = None,
+    depth_tensor: Optional[torch.Tensor] = None,
+    pose_scale: float = 0.0,
+    depth_scale: float = 0.0,
 ) -> torch.Tensor:
     """
     Generates a single predictive frame (P-Frame) using Flow-Guided Blending 
@@ -65,6 +70,19 @@ def generate_next_frame(
         latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
+        down_block_res, mid_block_res = None, None
+        if controlnet_wrapper is not None and (pose_scale > 0 or depth_scale > 0):
+            down_block_res, mid_block_res = controlnet_wrapper.get_residuals(
+                noisy_latents=latent_model_input,
+                t=t,
+                prompt_embeds=prompt_embeds,
+                added_cond_kwargs=added_cond_kwargs,
+                pose_tensor=pose_tensor,
+                depth_tensor=depth_tensor,
+                pose_scale=pose_scale,
+                depth_scale=depth_scale
+            )
+
         # Loss hesaplayacaksak gradyanı korumalıyız, aksi halde no_grad
         context_manager = torch.enable_grad() if (loss_module is not None) else torch.no_grad()
         with context_manager:
@@ -73,6 +91,8 @@ def generate_next_frame(
                 t,
                 encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs=added_cond_kwargs,
+                down_block_additional_residuals=down_block_res,
+                mid_block_additional_residual=mid_block_res,
                 return_dict=False
             )[0]
 
