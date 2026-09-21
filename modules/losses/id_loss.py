@@ -56,6 +56,10 @@ class IDLoss(BaseLoss):
         if target.device.type != self.device:
             target = target.to(self.device)
 
+        model_dtype = next(self.model.parameters()).dtype
+        pred = pred.to(dtype=model_dtype)
+        target = target.to(dtype=model_dtype)
+
         # Extract features
         # Note: Original implementation directly feeds frames without ImageNet normalization
         f_pred = self.model(pred)

@@ -1,0 +1,8 @@
+interpolation:
+  enabled: true
+  method: "rife"
+  exp: 3
+  fp16: true
+  skip: true
+  rife_path: "./external/RIFE"
+  gpu_id: 1

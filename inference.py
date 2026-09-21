@@ -1,150 +1,282 @@
-import torch
-import logging
-import sys
+# inference.py
 import os
-from typing import Optional, Dict, Any, List
+import sys
+import logging
+from typing import Dict, Any, Optional
 
-# --- GEREKLİ IMPORTLAR ---
-from diffusers import AutoencoderKL, EulerAncestralDiscreteScheduler
-# Orijinal UNet (Geçici yükleyici olarak kullanacağız)
-from diffusers import UNet2DConditionModel as OfficialUNet 
-from diffusers.utils import logging as diffusers_logging
+import torch
+import yaml
+import imageio
 
-# Local modüller
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    UNet2DConditionModel as OfficialUNet,
+)
+from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
 from utils.model_utils import get_device, flush_vram
 from pipelines.video_pipeline import SDXLVideoPipeline
+from modules.interpolation.rife import RIFEInterpolator
 
-# Senin Custom UNet'in (Hedef sınıf)
+# --- ALFAI CUSTOM UNET IMPORT ---
 try:
     from models.unet.unet_base import UNet2DConditionModel as CustomUNet
 except ImportError as e:
     print(f"HATA: models/unet/unet_base.py dosyası bulunamadı: {e}")
+    print("Lütfen sys.path veya Python çalışma dizininizin doğru olduğundan emin olun.")
     sys.exit(1)
 
-# Loglama Ayarları
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-# Gereksiz diffusers uyarılarını kapat
-diffusers_logging.set_verbosity_error()
+logger = logging.getLogger("inference")
 
+# SDXL base model ID (ağırlıklar yoksa HuggingFace'ten otomatik çekilir)
+SDXL_HF_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+
+
+# ============================================================
+# INTERPOLATION CONFIG LOADER
+# ============================================================
+def load_interpolation_config():
+    with open("configs/interpolation.yaml", "r") as f:
+        return yaml.safe_load(f)["interpolation"]
+
+
+# ============================================================
+# VIDEO GENERATOR
+# ============================================================
 class VideoGenerator:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.device = get_device(force_cpu=False)
-        
-        # Precision Ayarı (fp16 önerilir)
-        precision = config['runtime'].get('precision', 'fp16')
-        self.dtype = torch.float16 if precision == 'fp16' else torch.float32
-        
+        self.device = get_device()
+        self.dtype = (
+            torch.float16
+            if config.get("runtime", {}).get("precision", "fp16") == "fp16"
+            else torch.float32
+        )
+
         self.pipeline = None
+        self.tokenizer = None
+        self.tokenizer_2 = None
+        self.text_encoder = None
+        self.text_encoder_2 = None
+
         self._load_models()
 
+    # --------------------------------------------------------
+    # MODEL LOADING
+    # --------------------------------------------------------
     def _load_models(self):
-        logger.info(f"Modeller yükleniyor... Cihaz: {self.device}, Tip: {self.dtype}")
-        
-        try:
-            unet_path = self.config['paths']['models']['sdxl_base']
-            vae_path = self.config['paths']['models']['sdxl_vae']
+        logger.info("🔄 Loading SDXL models...")
 
-            # --- 1. ADIM: AĞIRLIKLARI ORİJİNAL SINIFLA AÇ ---
-            if not os.path.exists(unet_path):
-                raise FileNotFoundError(f"UNet modeli bulunamadı: {unet_path}")
-                
-            logger.info("1/3: Orijinal SDXL ağırlıkları okunuyor...")
-            
-            # Orijinal Diffusers sınıfını kullanarak yükle
-            # (Bu işlem safetensors -> pytorch state_dict dönüşümünü yapar)
-            temp_unet = OfficialUNet.from_single_file(
-                unet_path, 
-                torch_dtype=self.dtype
-            )
+        unet_path = self.config.get("paths", {}).get("models", {}).get("sdxl_base", None)
+        vae_path = self.config.get("paths", {}).get("models", {}).get("sdxl_vae", None)
 
-            # --- 2. ADIM: CUSTOM MODELE TRANSFER ET ---
-            logger.info("2/3: Ağırlıklar Custom UNet (unet_base.py) mimarisine aktarılıyor...")
-            
-            # Senin unet_base.py dosyanı, orijinal modelin konfigürasyonuyla başlat
-            custom_unet = CustomUNet(**temp_unet.config)
-            
-            # Ağırlıkları (State Dict) aktar
-            custom_unet.load_state_dict(temp_unet.state_dict())
-            
-            # Custom modeli doğru veri tipine çevir
-            custom_unet.to(dtype=self.dtype)
-            
-            # RAM temizliği: Temp modeli sil
-            del temp_unet
-            flush_vram()
+        # --- Text Encoders & Tokenizers (SDXL dual-encoder) ---
+        logger.info("Loading SDXL text encoders and tokenizers from HuggingFace...")
+        self.tokenizer = CLIPTokenizer.from_pretrained(SDXL_HF_ID, subfolder="tokenizer")
+        self.tokenizer_2 = CLIPTokenizer.from_pretrained(SDXL_HF_ID, subfolder="tokenizer_2")
 
-            # --- 3. ADIM: VAE, SCHEDULER VE PIPELINE ---
-            logger.info(f"3/3: VAE yükleniyor: {vae_path}")
-            if not os.path.exists(vae_path):
-                 raise FileNotFoundError(f"VAE bulunamadı: {vae_path}")
+        self.text_encoder = CLIPTextModel.from_pretrained(
+            SDXL_HF_ID, subfolder="text_encoder", torch_dtype=self.dtype
+        ).to(self.device)
+        self.text_encoder.eval()
 
-            vae = AutoencoderKL.from_single_file(
-                vae_path, 
-                torch_dtype=self.dtype
-            )
+        self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            SDXL_HF_ID, subfolder="text_encoder_2", torch_dtype=self.dtype
+        ).to(self.device)
+        self.text_encoder_2.eval()
 
-            # Scheduler'ı oluştur
-            scheduler_config = self.config['model'].get('scheduler', {})
-            scheduler = EulerAncestralDiscreteScheduler.from_config(scheduler_config)
-
-            logger.info("Pipeline kuruluyor...")
-            
-            # --- DÜZELTME BURADA ---
-            # Pipeline'a 'scheduler_config' değil, oluşturduğumuz 'scheduler' objesini veriyoruz.
-            self.pipeline = SDXLVideoPipeline(
-                vae=vae,
-                unet=custom_unet,
-                scheduler=scheduler 
-            )
-            
-            self.pipeline.to(self.device)
-            
-            # CPU Offload (VRAM yetersizse runtime.yaml'dan açılabilir)
-            if self.config['runtime'].get('enable_model_cpu_offload', False):
-                self.pipeline.enable_model_cpu_offload()
-
-            logger.info("✅ Tüm modeller başarıyla yüklendi.")
-
-        except Exception as e:
-            logger.error(f"❌ Model yükleme hatası: {e}")
-            import traceback
-            traceback.print_exc()
-            self.pipeline = None
-
-    def generate(self, prompt, negative_prompt="", num_frames=24, width=1024, height=576, seed=None):
-        if self.pipeline is None:
-            logger.error("Pipeline hazır değil. İşlem iptal edildi.")
-            return []
-
-        if seed is None:
-            generator = None
+        # --- UNet ---
+        # Yerel .safetensors dosyası varsa kullan, yoksa HuggingFace'ten yükle
+        if unet_path and os.path.isfile(unet_path):
+            logger.info(f"Loading UNet from local file: {unet_path}")
+            temp_unet = OfficialUNet.from_single_file(unet_path, torch_dtype=self.dtype)
         else:
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-
-        logger.info(f"🎬 Üretim Başlıyor: '{prompt}'")
-
-        try:
-            # pipelines/video_pipeline.py içindeki __call__ çalışır
-            output = self.pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                num_frames=num_frames,
-                width=width,
-                height=height,
-                num_inference_steps=self.config['model']['generation']['steps'],
-                guidance_scale=self.config['model']['generation']['guidance_scale'],
-                generator=generator
+            logger.info(f"UNet local file not found, loading from HuggingFace: {SDXL_HF_ID}")
+            temp_unet = OfficialUNet.from_pretrained(
+                SDXL_HF_ID, subfolder="unet", torch_dtype=self.dtype
             )
 
-            if self.config['runtime'].get('flush_vram_after_generation', True):
-                flush_vram()
-                
-            return output.frames
+        logger.info("Transferring weights to Custom UNet architecture...")
+        custom_unet = CustomUNet(**temp_unet.config)
+        custom_unet.load_state_dict(temp_unet.state_dict(), strict=False)
+        custom_unet.to(device=self.device, dtype=self.dtype)
+        del temp_unet
+        flush_vram()
 
+        # --- VAE ---
+        if vae_path and os.path.isfile(vae_path):
+            logger.info(f"Loading VAE from local file: {vae_path}")
+            vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=self.dtype).to(self.device)
+        else:
+            logger.info(f"VAE local file not found, loading from HuggingFace: {SDXL_HF_ID}")
+            vae = AutoencoderKL.from_pretrained(
+                SDXL_HF_ID, subfolder="vae", torch_dtype=self.dtype
+            ).to(self.device)
+
+        # --- Scheduler ---
+        logger.info("Loading scheduler...")
+        scheduler = DDIMScheduler.from_pretrained(SDXL_HF_ID, subfolder="scheduler")
+
+        # --- Video Pipeline ---
+        logger.info("Setting up SDXLVideoPipeline...")
+        self.pipeline = SDXLVideoPipeline(
+            unet=custom_unet,
+            vae=vae,
+            scheduler=scheduler,
+        )
+        self.pipeline.to(self.device)
+
+        if self.config.get("runtime", {}).get("enable_model_cpu_offload", False):
+            self.pipeline.enable_model_cpu_offload()
+
+        logger.info("✅ Models loaded successfully")
+
+    # --------------------------------------------------------
+    # PROMPT ENCODING (SDXL Dual Text Encoder)
+    # --------------------------------------------------------
+    def _encode_prompt(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        width: int = 1024,
+        height: int = 576,
+    ):
+        """
+        SDXL'in çift encoder'ını kullanarak prompt'u embeds'e çevirir.
+        Döner: (prompt_embeds, negative_prompt_embeds, added_cond_kwargs, negative_added_cond_kwargs)
+        CFG için cond + uncond birleştirilmiş tek tensör olarak döner.
+        """
+        def _encode_single(tokenizer, text_encoder, text):
+            tokens = tokenizer(
+                text,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            input_ids = tokens.input_ids.to(self.device)
+            with torch.no_grad():
+                out = text_encoder(input_ids, output_hidden_states=True)
+            # SDXL: penultimate hidden state
+            hidden = out.hidden_states[-2]
+            return hidden
+
+        def _encode_single_2(tokenizer, text_encoder, text):
+            tokens = tokenizer(
+                text,
+                padding="max_length",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            input_ids = tokens.input_ids.to(self.device)
+            with torch.no_grad():
+                out = text_encoder(input_ids, output_hidden_states=True)
+            hidden = out.hidden_states[-2]
+            pooled = out.text_embeds  # CLIPTextModelWithProjection'dan pooled embed
+            return hidden, pooled
+
+        # Cond
+        h1_cond = _encode_single(self.tokenizer, self.text_encoder, prompt)
+        h2_cond, pooled_cond = _encode_single_2(self.tokenizer_2, self.text_encoder_2, prompt)
+        prompt_embeds_cond = torch.cat([h1_cond, h2_cond], dim=-1)  # (1, 77, 2048)
+
+        # Uncond (negative)
+        h1_uncond = _encode_single(self.tokenizer, self.text_encoder, negative_prompt)
+        h2_uncond, pooled_uncond = _encode_single_2(self.tokenizer_2, self.text_encoder_2, negative_prompt)
+        prompt_embeds_uncond = torch.cat([h1_uncond, h2_uncond], dim=-1)  # (1, 77, 2048)
+
+        # CFG için cond + uncond birleştir (pipeline içinde chunk(2) ile ayrılacak)
+        prompt_embeds = torch.cat([prompt_embeds_uncond, prompt_embeds_cond], dim=0)  # (2, 77, 2048)
+        pooled_embeds = torch.cat([pooled_uncond, pooled_cond], dim=0)  # (2, 1280)
+
+        # SDXL added_cond_kwargs: time_ids = [orig_h, orig_w, crop_top, crop_left, target_h, target_w]
+        time_ids = torch.tensor(
+            [[height, width, 0, 0, height, width]],
+            dtype=self.dtype,
+            device=self.device,
+        ).repeat(2, 1)  # Uncond + Cond için 2 kopya
+
+        added_cond_kwargs = {
+            "text_embeds": pooled_embeds,
+            "time_ids": time_ids,
+        }
+
+        return prompt_embeds, added_cond_kwargs
+
+    # --------------------------------------------------------
+    # GENERATION
+    # --------------------------------------------------------
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        num_frames: int = 24,
+        width: int = 1024,
+        height: int = 576,
+        seed: Optional[int] = None,
+        ip_adapter_scale: float = 0.0,
+    ) -> str:
+        generator = (
+            torch.Generator(device=self.device).manual_seed(seed)
+            if seed is not None
+            else None
+        )
+
+        logger.info("🔤 Encoding prompt...")
+        prompt_embeds, added_cond_kwargs = self._encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+        )
+
+        # ----------------------------------------------------
+        # RUN SDXL VIDEO PIPELINE
+        # ----------------------------------------------------
+        logger.info(f"🎬 Starting generation for: '{prompt}'")
+        output = self.pipeline(
+            prompt_embeds=prompt_embeds,
+            added_cond_kwargs=added_cond_kwargs,
+            width=width,
+            height=height,
+            num_frames=num_frames,
+            num_inference_steps=self.config.get("model", {}).get("generation", {}).get("steps", 30),
+            guidance_scale=self.config.get("model", {}).get("generation", {}).get("guidance_scale", 7.5),
+            generator=generator,
+        )
+
+        frames = output.frames
+
+        # ----------------------------------------------------
+        # SAVE RAW VIDEO
+        # ----------------------------------------------------
+        os.makedirs("outputs", exist_ok=True)
+        raw_video_path = os.path.join("outputs", "raw_output.mp4")
+
+        imageio.mimsave(
+            raw_video_path,
+            [frame if not hasattr(frame, 'convert') else frame for frame in frames],
+            fps=self.config.get("model", {}).get("generation", {}).get("fps", 8),
+        )
+
+        logger.info(f"🎬 Raw video saved at {raw_video_path}")
+        flush_vram()
+
+        # ----------------------------------------------------
+        # POST-PROCESS WITH RIFE (opsiyonel)
+        # ----------------------------------------------------
+        try:
+            interp_config = load_interpolation_config()
+            if interp_config.get("enabled", False):
+                logger.info("🚀 Running RIFE post-process...")
+                interpolator = RIFEInterpolator(interp_config)
+                final_video_path = interpolator.interpolate(raw_video_path)
+                logger.info(f"✅ Smooth video saved at {final_video_path}")
+                return final_video_path
         except Exception as e:
-            logger.error(f"Generate hatası: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            logger.warning(f"RIFE post-process atlandı (hata veya config eksik): {e}")
+
+        return raw_video_path

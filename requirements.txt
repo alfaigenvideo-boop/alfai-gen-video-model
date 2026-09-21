@@ -1,5 +1,3 @@
--Pip kullanıcıları için bağımlılık listesi, Eğitim/test için tüm kütüphaneleri içermeli.
-
 # Temel
 diffusers>=0.30.0          # 0.35.2
 transformers>=4.45.0       # 4.57.1
@@ -21,6 +19,8 @@ httpx>=0.27.0              # 0.28.1
 imageio>=2.35.1            # 2.19.3 (DÜŞÜK)
 imageio-ffmpeg>=0.5.1      # YOK ŞUAN
 moviepy>=1.0.3             # YOK ŞUAN
+clip
+torchvision>=0.17.1        # 0.18.1
 
 
 

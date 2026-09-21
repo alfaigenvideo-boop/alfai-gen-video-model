@@ -57,6 +57,10 @@ class PerceptualLoss(BaseLoss):
         if target.device.type != self.device:
             target = target.to(self.device)
 
+        vgg_dtype = next(self.vgg.parameters()).dtype
+        pred = pred.to(dtype=vgg_dtype)
+        target = target.to(dtype=vgg_dtype)
+
         # Extract features
         # Note: Original implementation directly feeds frames without ImageNet normalization
         feat_pred = self.vgg(pred)

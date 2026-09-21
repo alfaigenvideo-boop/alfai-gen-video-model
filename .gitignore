@@ -1,4 +1,15 @@
+# Python önbellek dosyaları
 __pycache__/
+*.pyc
+
+# Sanal ortam
+venv/
+env/
+
+# Çevresel değişkenler ve gizli dosyalar
+.env
+.DS_Store
+
 .vscode/
 outputs/
 models/
