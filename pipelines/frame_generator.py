@@ -45,7 +45,7 @@ def generate_next_frame(
     do_classifier_free_guidance = guidance_scale > 1.0
 
     # 2. Denoising Loop (Adım Adım Gürültü Kaldırma ve Optimizasyon)
-    for i, t in enumerate(tqdm(scheduler.timesteps, desc="Generating Frame", leave=False)):
+    for i, t in enumerate(tqdm(scheduler.timesteps, desc="Generating Frame", leave=True)):
         
         # --- A. FLOW-GUIDED BLENDING ---
         # Warped latent'a o anki timestep (t) kadar gürültü ekleyip, 

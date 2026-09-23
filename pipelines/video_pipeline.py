@@ -67,18 +67,30 @@ class SDXLVideoPipeline(DiffusionPipeline):
         logger.info(f"SDXLVideoPipeline initialized on {self.device_name}. TSM Enabled: {self.enable_tsm}")
 
     def decode_latents(self, latents: torch.Tensor) -> List[Image.Image]:
-        latents = latents.to(dtype=self.vae.dtype)
-        latents = latents / self.vae.config.scaling_factor
-        
+        # SDXL VAE, fp16'da numerically unstable — decode sırasında NaN veya
+        # büyük değerler üretir, bunlar clamp ile 0'a (siyah) çekilir.
+        # Diffusers'ın resmi çözümü: decode sırasında geçici olarak fp32'ye geç.
+        original_dtype = self.vae.dtype
+        needs_upcast = original_dtype == torch.float16
+
+        if needs_upcast:
+            self.vae.to(dtype=torch.float32)
+
+        latents = latents.to(dtype=torch.float32) / self.vae.config.scaling_factor
+
         frames = []
-        # OOM (Out of Memory) yememek için kareleri tek tek decode ediyoruz
         with torch.no_grad():
             for i in range(latents.shape[0]):
                 decoded = self.vae.decode(latents[i : i + 1]).sample
                 decoded = (decoded / 2 + 0.5).clamp(0, 1)
                 img = decoded.cpu().permute(0, 2, 3, 1).float().numpy()[0]
-                frames.append(Image.fromarray((img * 255).astype("uint8")))
-                
+                img_safe = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+                frames.append(Image.fromarray((img_safe * 255).astype("uint8")))
+
+        # Decode bitti, VAE'yi eski dtype'a geri çek (VRAM'i serbest bırak)
+        if needs_upcast:
+            self.vae.to(dtype=original_dtype)
+
         return frames
 
     @torch.no_grad()

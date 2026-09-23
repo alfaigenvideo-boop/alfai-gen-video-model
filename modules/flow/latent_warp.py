@@ -87,7 +87,7 @@ class LatentWarper:
             latent_prev, 
             sampling_grid, 
             mode='bicubic', 
-            padding_mode='zeros',
+            padding_mode='border',   # 'zeros' → 'border': siyah kenar/küçülme efektini engeller
             align_corners=False
         )
         
