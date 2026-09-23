@@ -11,15 +11,18 @@ tqdm>=4.66.4               # 4.67.1
 PyYAML>=6.0.2              # 6.0
 python-dotenv>=1.0.1       # 1.1.1
 
-# Kontrol/adapter eko-sistemi 
+# Kontrol/adapter eko-sistemi
 huggingface_hub>=0.25.2    # 0.34.3
 httpx>=0.27.0              # 0.28.1
 
+# IP-Adapter FaceID (yüz kimliği koruması)
+insightface>=0.7.3         # ArcFace face embedding
+onnxruntime-gpu>=1.19.0    # GPU varsa. Sadece CPU için: onnxruntime
+
 # Video I/O
-imageio>=2.35.1            # 2.19.3 (DÜŞÜK)
-imageio-ffmpeg>=0.5.1      # YOK ŞUAN
-moviepy>=1.0.3             # YOK ŞUAN
-clip
+imageio>=2.35.1
+imageio-ffmpeg>=0.5.1
+moviepy>=1.0.3
 torchvision>=0.17.1        # 0.18.1
 
 

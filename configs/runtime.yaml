@@ -2,7 +2,13 @@ runtime:
   device: "cuda"          # "cuda" veya "cpu"
   precision: "fp16"       # "fp16" (hızlı/az vram) veya "fp32" (yüksek kalite)
   seed: 42                # Sabit seed (tekrarlanabilirlik için), rastgele için null bırak
-  
+
   # Bellek Yönetimi
   enable_model_cpu_offload: true   # VRAM yetmezse modeli RAM'e taşır (yavaşlatır ama çalıştırır)
   flush_vram_after_generation: true # Her üretimden sonra VRAM'i temizle
+
+# IP-Adapter FaceID Ayarları
+ip_adapter:
+  enabled: true           # false yaparak tamamen devre dışı bırakılabilir
+  local_path: null        # Yerel .bin dosyası varsa yolu gir, yoksa HuggingFace'ten indirilir
+  scale: 0.8              # 0.0 = kapalı, 1.0 = maksimum kimlik kilidi (0.6-0.9 önerilir)

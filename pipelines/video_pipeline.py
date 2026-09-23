@@ -13,9 +13,14 @@ from modules.flow.latent_warp import LatentWarper
 from pipelines.frame_generator import generate_next_frame
 from modules.flow.flow_factory import build_flow
 from modules.losses.loss_functions import build_loss
+from modules.prompt_to_prompt import PromptBlender
+from modules.interpolation.latent_interpolation import noise_blend_schedule
 
 # 🔥 TSM PATCH IMPORT
 from models.unet.unet_tsm_patch import inject_tsm_into_unet_midblock
+
+# 🎭 IP-ADAPTER FACEID IMPORT
+from modules.ip_adapter_wrapper import IPAdapterFaceID, FaceIDExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +69,33 @@ class SDXLVideoPipeline(DiffusionPipeline):
             
             self.warper = LatentWarper(device=self.device_name)
 
+        # ---------------------------------------------------
+        # 🎭 IP-ADAPTER FACEID (her iki modda da opsiyonel)
+        # ---------------------------------------------------
+        self.ip_adapter: Optional[IPAdapterFaceID] = None
+        self.face_extractor: Optional[FaceIDExtractor] = None
+
         logger.info(f"SDXLVideoPipeline initialized on {self.device_name}. TSM Enabled: {self.enable_tsm}")
+
+    def load_ip_adapter(self, local_path: Optional[str] = None, scale: float = 0.8) -> bool:
+        """
+        Loads IP-Adapter FaceID weights and injects attention processors into UNet.
+        Call after pipeline is created, before generation.
+
+        Args:
+            local_path: Local .bin file path. If None, downloads from HuggingFace.
+            scale: Initial IP-Adapter scale (0.0 = disabled, 1.0 = max identity lock).
+
+        Returns:
+            True if successfully loaded.
+        """
+        logger.info("Loading IP-Adapter FaceID...")
+        self.ip_adapter = IPAdapterFaceID(unet=self.unet, device=self.device_name, scale=scale)
+        success = self.ip_adapter.load_weights(local_path=local_path)
+        if not success:
+            self.ip_adapter = None
+        self.face_extractor = FaceIDExtractor(device="cpu")  # Face detection on CPU to save VRAM
+        return success
 
     def decode_latents(self, latents: torch.Tensor) -> List[Image.Image]:
         # SDXL VAE, fp16'da numerically unstable — decode sırasında NaN veya
@@ -107,6 +138,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
         target_driving_frames: Optional[List[torch.Tensor]] = None,
         ip_adapter_weights: Optional[List[float]] = None,
         initial_latent: Optional[torch.Tensor] = None,   # I2V: DDIM inversion çıktısı
+        ip_adapter_image_embeds: Optional[torch.Tensor] = None,  # I2V: Face embeds (1, 4, 2048)
         **kwargs: Any,
     ):
         # Güvenlik kontrolü: TSM açıksa num_frames, tsm_num_frames ile aynı olmalı
@@ -123,7 +155,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
             return self._generate_frame_by_frame(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
                 num_inference_steps, guidance_scale, generator, target_driving_frames,
-                ip_adapter_weights, initial_latent
+                ip_adapter_weights, initial_latent, ip_adapter_image_embeds
             )
 
     # =========================================================================
@@ -187,18 +219,37 @@ class SDXLVideoPipeline(DiffusionPipeline):
     # =========================================================================
     # MOD 2: ALFAI'S FRAME-BY-FRAME (FLOW + LOSS) MİMARİSİ
     # =========================================================================
-    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None):
+    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None):
         logger.info(f"Running in Frame-by-Frame (Flow & Loss) Mode for {num_frames} frames...")
         device = self._execution_device
         video_frames: List[Image.Image] = []
         is_dynamic_prompt = isinstance(prompt_embeds, list)
         is_dynamic_kwargs = isinstance(added_cond_kwargs, list)
 
+        # IP-Adapter ağırlık takvimi: [0.9, 0.9, ..., 0.6, ..., 0.3]
+        # Mevcut PromptBlender'dan üret, yoksa sabit ağırlık kullan
+        if ip_adapter_image_embeds is not None and self.ip_adapter is not None:
+            faceid_weight_schedule = PromptBlender.generate_ip_weights(num_frames)
+        else:
+            faceid_weight_schedule = [0.0] * num_frames
+
         # --- FRAME 0 ---
         curr_prompt_embeds = prompt_embeds[0] if is_dynamic_prompt else prompt_embeds
         curr_added_cond = added_cond_kwargs[0] if is_dynamic_kwargs else added_cond_kwargs
         curr_ip_weight = ip_weights[0] if ip_weights else None
         cross_attention_kwargs = {"scale": curr_ip_weight} if curr_ip_weight else None
+
+        # IP-Adapter: frame 0 için yüz embedding'ini prompt embed'e ekle
+        frame0_prompt_embeds = curr_prompt_embeds
+        if ip_adapter_image_embeds is not None and self.ip_adapter is not None:
+            scale_0 = faceid_weight_schedule[0]
+            self.ip_adapter.set_scale(scale_0)
+            # image embeds: (1, 4, 2048) → CFG için duplicate et (uncond + cond)
+            ip_embeds = ip_adapter_image_embeds.to(device=device, dtype=curr_prompt_embeds.dtype)
+            ip_embeds_cfg = torch.cat([torch.zeros_like(ip_embeds), ip_embeds], dim=0)  # (2, 4, 2048)
+            # prompt_embeds sonuna ekle: (2, 77+4, 2048)
+            frame0_prompt_embeds = torch.cat([curr_prompt_embeds, ip_embeds_cfg], dim=1)
+            logger.info(f"[I2V] Frame 0: IP-Adapter FaceID aktif (scale={scale_0:.2f}).")
 
         # I2V: initial_latent verilmişse DDIM inverted latent'ten başla
         # T2V: saf gürültüden başla
@@ -218,7 +269,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
 
             noise_pred = self.unet(
                 latent_input, t,
-                encoder_hidden_states=curr_prompt_embeds,
+                encoder_hidden_states=frame0_prompt_embeds,
                 added_cond_kwargs=curr_added_cond,
                 cross_attention_kwargs=cross_attention_kwargs,
             ).sample
@@ -233,11 +284,34 @@ class SDXLVideoPipeline(DiffusionPipeline):
         video_frames.extend(self.decode_latents(current_latents))
 
         # --- NEXT FRAMES (P-Frames) ---
+        # SLERP: I2V modunda P-frame başlangıç latent'leri
+        # DDIM latent'ten başlayarak giderek saf gürültüye blend yap
+        # T2V modunda saf rastgele gürültü kullan
+        if initial_latent is not None and num_frames > 1:
+            p_frame_latents = noise_blend_schedule(
+                ddim_latent=current_latents,
+                num_frames=num_frames - 1,    # frame 0 zaten üretildi
+                start_blend=0.15,             # frame 1: referansa çok yakın
+                end_blend=0.70,               # son frame: daha serbest
+                generator=generator,
+            )
+        else:
+            p_frame_latents = None  # T2V: generate_next_frame içinde rastgele gürültü
+
         for i in range(1, num_frames):
             curr_prompt_embeds = prompt_embeds[i] if is_dynamic_prompt else prompt_embeds
             curr_added_cond = added_cond_kwargs[i] if is_dynamic_kwargs else added_cond_kwargs
             curr_ip_weight = ip_weights[i] if ip_weights else None
             cross_attention_kwargs = {"scale": curr_ip_weight} if curr_ip_weight else None
+
+            # IP-Adapter: her frame için azalan ağırlık takvimi
+            frame_prompt_embeds = curr_prompt_embeds
+            if ip_adapter_image_embeds is not None and self.ip_adapter is not None:
+                scale_i = faceid_weight_schedule[i]
+                self.ip_adapter.set_scale(scale_i)
+                ip_embeds = ip_adapter_image_embeds.to(device=device, dtype=curr_prompt_embeds.dtype)
+                ip_embeds_cfg = torch.cat([torch.zeros_like(ip_embeds), ip_embeds], dim=0)
+                frame_prompt_embeds = torch.cat([curr_prompt_embeds, ip_embeds_cfg], dim=1)
 
             prev_image_pil = video_frames[-1]
             prev_image_tensor = torch.from_numpy(np.array(prev_image_pil)).permute(2, 0, 1).unsqueeze(0).float() / 255.0
@@ -252,10 +326,11 @@ class SDXLVideoPipeline(DiffusionPipeline):
 
             next_latents = generate_next_frame(
                 unet=self.unet, scheduler=self.scheduler, previous_latents_warped=warped_latents, mask=mask,
-                prompt_embeds=curr_prompt_embeds, added_cond_kwargs=curr_added_cond, cross_attention_kwargs=cross_attention_kwargs,
+                prompt_embeds=frame_prompt_embeds, added_cond_kwargs=curr_added_cond, cross_attention_kwargs=cross_attention_kwargs,
                 height=height, width=width, num_inference_steps=steps, guidance_scale=cfg, device=device, generator=generator,
                 loss_module=self.loss_module, text_prompt="", prev_image_tensor=prev_image_tensor,
                 vae=self.vae,
+                initial_latent=p_frame_latents[i - 1] if p_frame_latents else None,  # SLERP latent
             )
 
             video_frames.extend(self.decode_latents(next_latents))

@@ -136,11 +136,23 @@ class VideoGenerator:
             self.pipeline.enable_model_cpu_offload()
 
         # DDIMInversion: referans görsel → latent dönüştürmek için
-        # Null prompt embeds (sıfır tensör) ile başlatılıyor
         self.inverter = DDIMInversion(
             pipe=self.pipeline,
             device=self.device,
         )
+
+        # IP-Adapter FaceID: yüklenmeye çalış, başarısızsa sessizce devam et
+        ip_cfg = self.config.get("ip_adapter", {})
+        if ip_cfg.get("enabled", True):  # Default açık — insightface yüklendi mi kontrol eder
+            local_path = ip_cfg.get("local_path", None)
+            scale = ip_cfg.get("scale", 0.8)
+            success = self.pipeline.load_ip_adapter(local_path=local_path, scale=scale)
+            if success:
+                logger.info("✅ IP-Adapter FaceID aktif. Yüz kimliği korumalı video üretimi hazır.")
+            else:
+                logger.warning("⚠️ IP-Adapter yüklenemedi. insightface yüklenmemiş olabilir.")
+        else:
+            logger.info("IP-Adapter config'de devre dışı bırakılmış.")
 
         logger.info("✅ Models loaded successfully")
 
@@ -247,33 +259,51 @@ class VideoGenerator:
         )
 
         # --------------------------------------------------------
-        # I2V: Referans fotoğraf varsa DDIM inversion ile latent ankrajı oluştur
+        # --------------------------------------------------------
+        # I2V: Referans fotoğraf varsa DDIM inversion + IP-Adapter face embeds
         # --------------------------------------------------------
         initial_latent = None
         target_driving_frames = None
+        ip_adapter_image_embeds = None
+
         if reference_image_path and Path(reference_image_path).exists():
+            import numpy as _np  # zaten import'lu ama explicit olsun
             logger.info(f"📷 I2V Modu: Referans fotoğraf yükleniyor → {reference_image_path}")
             ref_img = Image.open(reference_image_path).convert("RGB").resize((width, height))
             ref_np = np.array(ref_img).astype(np.float32) / 255.0
 
-            # [H,W,3] → [1,3,H,W], normalize to [-1,1] for VAE
+            # VAE encode için [-1, 1]
             ref_tensor_vae = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0)
             ref_tensor_vae = (ref_tensor_vae * 2 - 1).to(device=self.device, dtype=torch.float32)
 
-            # [0,1] aralığında pixel tensor (flow hesabı için)
+            # Flow için [0, 1]
             ref_tensor_flow = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
 
-            # stop_at_t=600: görselin yapısını koru ama prompt'un etki etmesine yer bırak
-            # (1000 = tamamen gürültü, 0 = orijinal görsel)
+            # DDIM Inversion
             logger.info("🔄 DDIM Inversion çalıştırılıyor (stop_at_t=600)...")
             initial_latent = self.inverter.invert(
                 image=ref_tensor_vae,
                 num_steps=num_inference_steps,
-                stop_at_t=600,
+                stop_at_t=420,   # 600→420: ifade ve yapı daha iyi korunur
             )
             logger.info("✅ Referans görsel latent uzayına dönüştürüldü.")
 
-            # Tüm P-frame'lerde flow hedefi olarak referans kullanılır
+            # IP-Adapter FaceID: Yüz embedding çıkar
+            if (
+                self.pipeline.ip_adapter is not None
+                and self.pipeline.face_extractor is not None
+                and self.pipeline.face_extractor.app is not None
+            ):
+                ref_img_uint8 = (np.array(ref_img)).astype("uint8")
+                face_embedding = self.pipeline.face_extractor.extract(ref_img_uint8)
+                if face_embedding is not None:
+                    ip_adapter_image_embeds = self.pipeline.ip_adapter.get_image_embeds(face_embedding)
+                    logger.info("✅ IP-Adapter FaceID embedding hazır — kimlik ankrajı aktif.")
+                else:
+                    logger.warning("⚠️ Referans fotoğrafta yüz tespit edilemedi — IP-Adapter atlanıyor.")
+            else:
+                logger.info("IP-Adapter yüklenmemiş, face embedding atlanıyor.")
+
             target_driving_frames = [ref_tensor_flow] * num_frames
         else:
             if reference_image_path:
@@ -294,7 +324,8 @@ class VideoGenerator:
             guidance_scale=self.config.get("model", {}).get("generation", {}).get("guidance_scale", 7.5),
             generator=generator,
             target_driving_frames=target_driving_frames,
-            initial_latent=initial_latent,  # I2V: DDIM inverted latent (T2V'de None)
+            initial_latent=initial_latent,
+            ip_adapter_image_embeds=ip_adapter_image_embeds,  # None ise devre dışı
         )
 
         frames = output.frames

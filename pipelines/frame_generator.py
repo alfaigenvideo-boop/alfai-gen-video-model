@@ -26,6 +26,7 @@ def generate_next_frame(
     prev_image_tensor: Optional[torch.Tensor] = None,
     vae: Optional[torch.nn.Module] = None,
     loss_scale: float = 0.5,
+    initial_latent: Optional[torch.Tensor] = None,  # SLERP: I2V P-frame başlangıç latent'i
 ) -> torch.Tensor:
     """
     Generates a single predictive frame (P-Frame) using Flow-Guided Blending 
@@ -34,12 +35,17 @@ def generate_next_frame(
     """
     
     # 1. Başlangıç Gürültüsü (Latent t_T)
-    latents = torch.randn(
-        (1, 4, height // 8, width // 8),
-        generator=generator,
-        device=device,
-        dtype=unet.dtype
-    )
+    # I2V modunda: SLERP ile üretilmiş karmaşık latent (referansa yakın)
+    # T2V modunda: saf rastgele gürültü
+    if initial_latent is not None:
+        latents = initial_latent.to(device=device, dtype=unet.dtype)
+    else:
+        latents = torch.randn(
+            (1, 4, height // 8, width // 8),
+            generator=generator,
+            device=device,
+            dtype=unet.dtype
+        )
 
     scheduler.set_timesteps(num_inference_steps, device=device)
     do_classifier_free_guidance = guidance_scale > 1.0
