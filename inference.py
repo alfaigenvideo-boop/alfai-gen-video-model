@@ -3,10 +3,13 @@ import os
 import sys
 import logging
 from typing import Dict, Any, Optional
+from pathlib import Path
 
 import torch
 import yaml
 import imageio
+import numpy as np
+from PIL import Image
 
 from diffusers import (
     AutoencoderKL,
@@ -18,6 +21,7 @@ from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokeniz
 from utils.model_utils import get_device, flush_vram
 from pipelines.video_pipeline import SDXLVideoPipeline
 from modules.interpolation.rife import RIFEInterpolator
+from modules.inversion.ddim_inversion import DDIMInversion
 
 # --- ALFAI CUSTOM UNET IMPORT ---
 try:
@@ -131,6 +135,13 @@ class VideoGenerator:
         if self.config.get("runtime", {}).get("enable_model_cpu_offload", False):
             self.pipeline.enable_model_cpu_offload()
 
+        # DDIMInversion: referans görsel → latent dönüştürmek için
+        # Null prompt embeds (sıfır tensör) ile başlatılıyor
+        self.inverter = DDIMInversion(
+            pipe=self.pipeline,
+            device=self.device,
+        )
+
         logger.info("✅ Models loaded successfully")
 
     # --------------------------------------------------------
@@ -216,7 +227,9 @@ class VideoGenerator:
         num_frames: int = 24,
         width: int = 1024,
         height: int = 576,
+        num_inference_steps: int = 30,
         seed: Optional[int] = None,
+        reference_image_path: Optional[str] = None,  # I2V: tek referans fotoğraf
         ip_adapter_scale: float = 0.0,
     ) -> str:
         generator = (
@@ -233,6 +246,40 @@ class VideoGenerator:
             height=height,
         )
 
+        # --------------------------------------------------------
+        # I2V: Referans fotoğraf varsa DDIM inversion ile latent ankrajı oluştur
+        # --------------------------------------------------------
+        initial_latent = None
+        target_driving_frames = None
+        if reference_image_path and Path(reference_image_path).exists():
+            logger.info(f"📷 I2V Modu: Referans fotoğraf yükleniyor → {reference_image_path}")
+            ref_img = Image.open(reference_image_path).convert("RGB").resize((width, height))
+            ref_np = np.array(ref_img).astype(np.float32) / 255.0
+
+            # [H,W,3] → [1,3,H,W], normalize to [-1,1] for VAE
+            ref_tensor_vae = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0)
+            ref_tensor_vae = (ref_tensor_vae * 2 - 1).to(device=self.device, dtype=torch.float32)
+
+            # [0,1] aralığında pixel tensor (flow hesabı için)
+            ref_tensor_flow = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+            # stop_at_t=600: görselin yapısını koru ama prompt'un etki etmesine yer bırak
+            # (1000 = tamamen gürültü, 0 = orijinal görsel)
+            logger.info("🔄 DDIM Inversion çalıştırılıyor (stop_at_t=600)...")
+            initial_latent = self.inverter.invert(
+                image=ref_tensor_vae,
+                num_steps=num_inference_steps,
+                stop_at_t=600,
+            )
+            logger.info("✅ Referans görsel latent uzayına dönüştürüldü.")
+
+            # Tüm P-frame'lerde flow hedefi olarak referans kullanılır
+            target_driving_frames = [ref_tensor_flow] * num_frames
+        else:
+            if reference_image_path:
+                logger.warning(f"⚠️ Referans fotoğraf bulunamadı: {reference_image_path} — T2V modunda devam ediliyor.")
+            logger.info("🎬 T2V Modu: Saf prompt'tan üretim yapılıyor.")
+
         # ----------------------------------------------------
         # RUN SDXL VIDEO PIPELINE
         # ----------------------------------------------------
@@ -243,9 +290,11 @@ class VideoGenerator:
             width=width,
             height=height,
             num_frames=num_frames,
-            num_inference_steps=self.config.get("model", {}).get("generation", {}).get("steps", 30),
+            num_inference_steps=num_inference_steps,
             guidance_scale=self.config.get("model", {}).get("generation", {}).get("guidance_scale", 7.5),
             generator=generator,
+            target_driving_frames=target_driving_frames,
+            initial_latent=initial_latent,  # I2V: DDIM inverted latent (T2V'de None)
         )
 
         frames = output.frames

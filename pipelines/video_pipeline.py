@@ -105,7 +105,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
         guidance_scale: float = 7.5,
         generator: Optional[torch.Generator] = None,
         target_driving_frames: Optional[List[torch.Tensor]] = None,
-        ip_adapter_weights: Optional[List[float]] = None,            
+        ip_adapter_weights: Optional[List[float]] = None,
+        initial_latent: Optional[torch.Tensor] = None,   # I2V: DDIM inversion çıktısı
         **kwargs: Any,
     ):
         # Güvenlik kontrolü: TSM açıksa num_frames, tsm_num_frames ile aynı olmalı
@@ -121,7 +122,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
         else:
             return self._generate_frame_by_frame(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
-                num_inference_steps, guidance_scale, generator, target_driving_frames, ip_adapter_weights
+                num_inference_steps, guidance_scale, generator, target_driving_frames,
+                ip_adapter_weights, initial_latent
             )
 
     # =========================================================================
@@ -185,7 +187,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
     # =========================================================================
     # MOD 2: ALFAI'S FRAME-BY-FRAME (FLOW + LOSS) MİMARİSİ
     # =========================================================================
-    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights):
+    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None):
         logger.info(f"Running in Frame-by-Frame (Flow & Loss) Mode for {num_frames} frames...")
         device = self._execution_device
         video_frames: List[Image.Image] = []
@@ -198,7 +200,15 @@ class SDXLVideoPipeline(DiffusionPipeline):
         curr_ip_weight = ip_weights[0] if ip_weights else None
         cross_attention_kwargs = {"scale": curr_ip_weight} if curr_ip_weight else None
 
-        latents = torch.randn((1, 4, height // 8, width // 8), device=device, generator=generator, dtype=self.unet.dtype)
+        # I2V: initial_latent verilmişse DDIM inverted latent'ten başla
+        # T2V: saf gürültüden başla
+        if initial_latent is not None:
+            logger.info("[I2V] Frame 0: DDIM inverted latent kullanılıyor (referans görsel ankrajı).")
+            latents = initial_latent.to(device=device, dtype=self.unet.dtype)
+        else:
+            logger.info("[T2V] Frame 0: Saf gürültüden başlanıyor.")
+            latents = torch.randn((1, 4, height // 8, width // 8), device=device, generator=generator, dtype=self.unet.dtype)
+
         self.scheduler.set_timesteps(steps, device=device)
         do_cfg = cfg > 1.0
 
