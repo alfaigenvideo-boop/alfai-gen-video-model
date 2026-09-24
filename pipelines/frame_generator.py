@@ -27,11 +27,13 @@ def generate_next_frame(
     vae: Optional[torch.nn.Module] = None,
     loss_scale: float = 0.5,
     initial_latent: Optional[torch.Tensor] = None,  # SLERP: I2V P-frame başlangıç latent'i
+    down_intrablock_additional_residuals: Optional[List[torch.Tensor]] = None,  # T2I-Adapter residuals
 ) -> torch.Tensor:
     """
     Generates a single predictive frame (P-Frame) using Flow-Guided Blending 
     and Loss-Guided Diffusion Optimization (Universal Guidance).
-    Includes support for IP-Adapter via cross_attention_kwargs.
+    Includes support for IP-Adapter via cross_attention_kwargs and
+    T2I-Adapter via down_intrablock_additional_residuals.
     """
     
     # 1. Başlangıç Gürültüsü (Latent t_T)
@@ -77,12 +79,17 @@ def generate_next_frame(
 
         # ❗ KRİTİK DÜZELTME: UNET TAHMİNİ HER ZAMAN no_grad İÇİNDE OLMALI
         with torch.no_grad():
+            t2i_residuals = None
+            if down_intrablock_additional_residuals is not None:
+                t2i_residuals = [r.clone() for r in down_intrablock_additional_residuals]
+
             noise_pred = unet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs=added_cond_kwargs,
-                cross_attention_kwargs=cross_attention_kwargs, 
+                cross_attention_kwargs=cross_attention_kwargs,
+                down_intrablock_additional_residuals=t2i_residuals,
                 return_dict=False
             )[0]
 

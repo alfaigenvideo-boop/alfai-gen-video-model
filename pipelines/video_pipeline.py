@@ -22,6 +22,9 @@ from models.unet.unet_tsm_patch import inject_tsm_into_unet_midblock
 # 🎭 IP-ADAPTER FACEID IMPORT
 from modules.ip_adapter_wrapper import IPAdapterFaceID, FaceIDExtractor
 
+# 🧭 T2I-ADAPTER (lightweight geometry lock; ControlNet alternative)
+from modules.t2i_adapter_wrapper import T2IAdapterWrapper
+
 logger = logging.getLogger(__name__)
 
 class SDXLVideoPipeline(DiffusionPipeline):
@@ -75,6 +78,11 @@ class SDXLVideoPipeline(DiffusionPipeline):
         self.ip_adapter: Optional[IPAdapterFaceID] = None
         self.face_extractor: Optional[FaceIDExtractor] = None
 
+        # ---------------------------------------------------
+        # 🧭 T2I-ADAPTER (pose/depth/canny; her iki modda da opsiyonel)
+        # ---------------------------------------------------
+        self.t2i_adapter: Optional[T2IAdapterWrapper] = None
+
         logger.info(f"SDXLVideoPipeline initialized on {self.device_name}. TSM Enabled: {self.enable_tsm}")
 
     def load_ip_adapter(self, local_path: Optional[str] = None, scale: float = 0.8) -> bool:
@@ -96,6 +104,78 @@ class SDXLVideoPipeline(DiffusionPipeline):
             self.ip_adapter = None
         self.face_extractor = FaceIDExtractor(device="cpu")  # Face detection on CPU to save VRAM
         return success
+
+    def load_t2i_adapter(
+        self,
+        adapter_type: str = "canny",
+        local_path: Optional[str] = None,
+        scale: float = 0.8,
+        source: str = "hybrid",
+        canny_low: int = 100,
+        canny_high: int = 200,
+        dtype: Optional[torch.dtype] = None,
+    ) -> bool:
+        """
+        Loads T2I-Adapter weights. Call after pipeline is created, before generation.
+
+        Args:
+            adapter_type: canny | depth | pose | lineart | sketch
+            local_path: Local adapter folder. If None, downloads from HuggingFace.
+            scale: Residual strength (0.0 = off, 1.0 = full geometry lock).
+            source: reference | previous_frame | hybrid
+            dtype: Defaults to UNet dtype.
+        """
+        resolved_dtype = dtype or next(self.unet.parameters()).dtype
+        logger.info(f"Loading T2I-Adapter ({adapter_type})...")
+        self.t2i_adapter = T2IAdapterWrapper(
+            device=self.device_name,
+            dtype=resolved_dtype,
+            scale=scale,
+            source=source,
+            condition_type=adapter_type,
+            canny_low=canny_low,
+            canny_high=canny_high,
+        )
+        success = self.t2i_adapter.load(local_path=local_path)
+        if not success:
+            self.t2i_adapter = None
+        return success
+
+    def _resolve_t2i_residuals(
+        self,
+        frame_index: int,
+        do_cfg: bool,
+        ref_residuals: Optional[List[torch.Tensor]] = None,
+        prev_image_pil: Optional[Image.Image] = None,
+        batch_size: int = 1,
+    ) -> Optional[List[torch.Tensor]]:
+        """Picks reference vs previous-frame residuals and expands for CFG / TSM batch."""
+        if self.t2i_adapter is None:
+            return None
+
+        source = self.t2i_adapter.source
+        residuals = None
+
+        if source == "reference":
+            residuals = ref_residuals
+        elif source == "previous_frame":
+            if prev_image_pil is not None:
+                residuals = self.t2i_adapter.encode_image(prev_image_pil)
+            else:
+                residuals = ref_residuals
+        else:  # hybrid
+            if frame_index == 0:
+                residuals = ref_residuals
+            elif prev_image_pil is not None:
+                residuals = self.t2i_adapter.encode_image(prev_image_pil)
+            else:
+                residuals = ref_residuals
+
+        if residuals is None:
+            return None
+
+        residuals = T2IAdapterWrapper.repeat_for_batch(residuals, batch_size)
+        return T2IAdapterWrapper.expand_for_cfg(residuals, do_cfg)
 
     def decode_latents(self, latents: torch.Tensor) -> List[Image.Image]:
         # SDXL VAE, fp16'da numerically unstable — decode sırasında NaN veya
@@ -139,6 +219,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
         ip_adapter_weights: Optional[List[float]] = None,
         initial_latent: Optional[torch.Tensor] = None,   # I2V: DDIM inversion çıktısı
         ip_adapter_image_embeds: Optional[torch.Tensor] = None,  # I2V: Face embeds (1, 4, 2048)
+        t2i_residuals: Optional[List[torch.Tensor]] = None,  # I2V: T2I-Adapter residuals from reference
         **kwargs: Any,
     ):
         # Güvenlik kontrolü: TSM açıksa num_frames, tsm_num_frames ile aynı olmalı
@@ -149,19 +230,21 @@ class SDXLVideoPipeline(DiffusionPipeline):
         if self.enable_tsm:
             return self._generate_batch_temporal(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
-                num_inference_steps, guidance_scale, generator, ip_adapter_weights
+                num_inference_steps, guidance_scale, generator, ip_adapter_weights,
+                t2i_residuals,
             )
         else:
             return self._generate_frame_by_frame(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
                 num_inference_steps, guidance_scale, generator, target_driving_frames,
-                ip_adapter_weights, initial_latent, ip_adapter_image_embeds
+                ip_adapter_weights, initial_latent, ip_adapter_image_embeds,
+                t2i_residuals,
             )
 
     # =========================================================================
     # MOD 1: ISHTIAQ'S BATCH TEMPORAL (TSM) MİMARİSİ
     # =========================================================================
-    def _generate_batch_temporal(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, ip_weights):
+    def _generate_batch_temporal(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, ip_weights, t2i_residuals=None):
         logger.info(f"Running in Batch Temporal (TSM) Mode for {num_frames} frames...")
         device = self._execution_device
         batch_size = 1
@@ -196,6 +279,14 @@ class SDXLVideoPipeline(DiffusionPipeline):
         avg_ip_weight = sum(ip_weights) / len(ip_weights) if ip_weights else None
         cross_attention_kwargs = {"scale": avg_ip_weight} if avg_ip_weight else None
 
+        t2i_cfg_residuals = self._resolve_t2i_residuals(
+            frame_index=0,
+            do_cfg=do_cfg,
+            ref_residuals=t2i_residuals,
+            prev_image_pil=None,
+            batch_size=num_frames,
+        )
+
         for t in self.scheduler.timesteps:
             latent_input = torch.cat([latents, latents], dim=0) if do_cfg else latents
             latent_input = self.scheduler.scale_model_input(latent_input, t)
@@ -206,6 +297,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 encoder_hidden_states=curr_prompt_embeds,
                 added_cond_kwargs=curr_added_cond,
                 cross_attention_kwargs=cross_attention_kwargs,
+                down_intrablock_additional_residuals=T2IAdapterWrapper.clone_residuals(t2i_cfg_residuals),
             ).sample
 
             if do_cfg:
@@ -219,7 +311,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
     # =========================================================================
     # MOD 2: ALFAI'S FRAME-BY-FRAME (FLOW + LOSS) MİMARİSİ
     # =========================================================================
-    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None):
+    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None, t2i_residuals=None):
         logger.info(f"Running in Frame-by-Frame (Flow & Loss) Mode for {num_frames} frames...")
         device = self._execution_device
         video_frames: List[Image.Image] = []
@@ -263,6 +355,15 @@ class SDXLVideoPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(steps, device=device)
         do_cfg = cfg > 1.0
 
+        frame0_t2i = self._resolve_t2i_residuals(
+            frame_index=0,
+            do_cfg=do_cfg,
+            ref_residuals=t2i_residuals,
+            prev_image_pil=None,
+        )
+        if frame0_t2i is not None:
+            logger.info(f"[T2I] Frame 0: T2I-Adapter aktif (type={self.t2i_adapter.condition_type}, scale={self.t2i_adapter.scale:.2f}).")
+
         for t in self.scheduler.timesteps:
             latent_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_input = self.scheduler.scale_model_input(latent_input, t)
@@ -272,6 +373,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 encoder_hidden_states=frame0_prompt_embeds,
                 added_cond_kwargs=curr_added_cond,
                 cross_attention_kwargs=cross_attention_kwargs,
+                down_intrablock_additional_residuals=T2IAdapterWrapper.clone_residuals(frame0_t2i),
             ).sample
 
             if do_cfg:
@@ -331,6 +433,12 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 loss_module=self.loss_module, text_prompt="", prev_image_tensor=prev_image_tensor,
                 vae=self.vae,
                 initial_latent=p_frame_latents[i - 1] if p_frame_latents else None,  # SLERP latent
+                down_intrablock_additional_residuals=self._resolve_t2i_residuals(
+                    frame_index=i,
+                    do_cfg=do_cfg,
+                    ref_residuals=t2i_residuals,
+                    prev_image_pil=prev_image_pil,
+                ),
             )
 
             video_frames.extend(self.decode_latents(next_latents))

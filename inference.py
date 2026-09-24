@@ -154,6 +154,25 @@ class VideoGenerator:
         else:
             logger.info("IP-Adapter config'de devre dışı bırakılmış.")
 
+        # T2I-Adapter: geometri kilidi (ControlNet yerine hafif residual yolu)
+        t2i_cfg = self.config.get("t2i_adapter", {})
+        if t2i_cfg.get("enabled", True):
+            success = self.pipeline.load_t2i_adapter(
+                adapter_type=t2i_cfg.get("type", "canny"),
+                local_path=t2i_cfg.get("local_path", None),
+                scale=t2i_cfg.get("scale", 0.8),
+                source=t2i_cfg.get("source", "hybrid"),
+                canny_low=t2i_cfg.get("canny_low", 100),
+                canny_high=t2i_cfg.get("canny_high", 200),
+                dtype=self.dtype,
+            )
+            if success:
+                logger.info("✅ T2I-Adapter aktif. Geometri kilidi (canny/depth/pose) hazır.")
+            else:
+                logger.warning("⚠️ T2I-Adapter yüklenemedi. Bu koşuda geometri kilidi kapalı.")
+        else:
+            logger.info("T2I-Adapter config'de devre dışı bırakılmış.")
+
         logger.info("✅ Models loaded successfully")
 
     # --------------------------------------------------------
@@ -265,6 +284,7 @@ class VideoGenerator:
         initial_latent = None
         target_driving_frames = None
         ip_adapter_image_embeds = None
+        t2i_residuals = None
 
         if reference_image_path and Path(reference_image_path).exists():
             import numpy as _np  # zaten import'lu ama explicit olsun
@@ -304,6 +324,17 @@ class VideoGenerator:
             else:
                 logger.info("IP-Adapter yüklenmemiş, face embedding atlanıyor.")
 
+            # T2I-Adapter: referans görselden geometri koşulu (canny/depth/pose)
+            if self.pipeline.t2i_adapter is not None:
+                t2i_residuals = self.pipeline.t2i_adapter.encode_image(ref_img)
+                if t2i_residuals is not None:
+                    logger.info(
+                        f"✅ T2I-Adapter residual hazır — geometri kilidi aktif "
+                        f"({self.pipeline.t2i_adapter.condition_type})."
+                    )
+            else:
+                logger.info("T2I-Adapter yüklenmemiş, geometri kilidi atlanıyor.")
+
             target_driving_frames = [ref_tensor_flow] * num_frames
         else:
             if reference_image_path:
@@ -326,6 +357,7 @@ class VideoGenerator:
             target_driving_frames=target_driving_frames,
             initial_latent=initial_latent,
             ip_adapter_image_embeds=ip_adapter_image_embeds,  # None ise devre dışı
+            t2i_residuals=t2i_residuals,  # None ise T2I-Adapter frame 0'da kapalı; P-frame'de previous_frame/hybrid çalışır
         )
 
         frames = output.frames

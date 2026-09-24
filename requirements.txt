@@ -19,6 +19,10 @@ httpx>=0.27.0              # 0.28.1
 insightface>=0.7.3         # ArcFace face embedding
 onnxruntime-gpu>=1.19.0    # GPU varsa. Sadece CPU için: onnxruntime
 
+# T2I-Adapter: canny için ekstra paket gerekmez (OpenCV zaten var).
+# depth / pose / lineart / sketch için:
+# controlnet-aux>=0.0.9
+
 # Video I/O
 imageio>=2.35.1
 imageio-ffmpeg>=0.5.1

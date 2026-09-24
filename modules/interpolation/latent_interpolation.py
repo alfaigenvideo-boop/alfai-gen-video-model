@@ -60,6 +60,21 @@ def slerp(t: float, v0: torch.Tensor, v1: torch.Tensor, dot_threshold: float = 0
     return result_flat.reshape(orig_shape).to(dtype=v0.dtype)
 
 
+def slerp_embeddings(t: float, v0: torch.Tensor, v1: torch.Tensor, dot_threshold: float = 0.9995) -> torch.Tensor:
+    """
+    Token-wise SLERP for CLIP / SDXL prompt embeddings.
+
+    Last dimension is the embedding axis (e.g. 2048 or 1280). Each token
+    interpolates on its own sphere so scene semantics blend instead of
+    collapsing the whole (seq, dim) vector into one direction.
+    """
+    orig_shape = v0.shape
+    v0_tok = v0.reshape(-1, orig_shape[-1])
+    v1_tok = v1.reshape(-1, orig_shape[-1])
+    out = slerp(t, v0_tok, v1_tok, dot_threshold=dot_threshold)
+    return out.reshape(orig_shape)
+
+
 def lerp(t: float, v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
     """
     Linear interpolation between two latent tensors.

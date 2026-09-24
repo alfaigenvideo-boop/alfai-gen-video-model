@@ -12,3 +12,15 @@ ip_adapter:
   enabled: true           # false yaparak tamamen devre dışı bırakılabilir
   local_path: null        # Yerel .bin dosyası varsa yolu gir, yoksa HuggingFace'ten indirilir
   scale: 0.8              # 0.0 = kapalı, 1.0 = maksimum kimlik kilidi (0.6-0.9 önerilir)
+
+# T2I-Adapter Ayarları (ControlNet yerine hafif geometri kilidi — RTX 6–8 GB için)
+# type: canny (test, ekstra detector yok) | depth | pose | lineart | sketch
+# source: hybrid = frame 0 referans, sonraki kareler previous frame
+t2i_adapter:
+  enabled: true
+  type: "canny"
+  local_path: null        # Yerel adapter klasörü varsa yolu gir, yoksa HuggingFace
+  scale: 0.8              # Residual gücü (0.6–0.9 önerilir)
+  source: "hybrid"        # reference | previous_frame | hybrid
+  canny_low: 100
+  canny_high: 200

@@ -13,7 +13,12 @@ FILES_TO_DOWNLOAD = {
         "repo_id": "madebyollin/sdxl-vae-fp16-fix",  # veya sd-xl base içindeki VAE
         "files": ["sdxl_vae.safetensors"],           # wildcard için: "*.safetensors"
         "dest": ROOT / "models/sdxl_vae/minimal"
-    }
+    },
+    "t2i_adapter_canny": {
+        "repo_id": "TencentARC/t2i-adapter-canny-sdxl-1.0",
+        "files": ["diffusion_pytorch_model.safetensors", "config.json"],
+        "dest": ROOT / "models/t2i_adapter/canny"
+    },
 }
 
 
@@ -42,7 +47,7 @@ def main():
             print(f"   Downloading file: {file}")
             hf_download_file(repo, file, dest)
 
-    print("\nOnly UNet + VAE files downloaded. Done.")
+    print("\nUNet + VAE + T2I-Adapter (canny) files downloaded. Done.")
 
 
 if __name__ == "__main__":

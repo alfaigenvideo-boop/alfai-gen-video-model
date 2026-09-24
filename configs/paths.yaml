@@ -7,6 +7,7 @@ paths:
     # İleride eklenecekler için yer tutucular
     ip_adapter: "${paths.base_dir}/models/ip_adapter/"
     controlnet: "${paths.base_dir}/models/controlnet/"
+    t2i_adapter: "${paths.base_dir}/models/t2i_adapter/"
 
   output:
     videos: "${paths.base_dir}/outputs/videos/"
