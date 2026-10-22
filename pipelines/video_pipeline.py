@@ -25,6 +25,9 @@ from modules.ip_adapter_wrapper import IPAdapterFaceID, FaceIDExtractor
 # 🧭 T2I-ADAPTER (lightweight geometry lock; ControlNet alternative)
 from modules.t2i_adapter_wrapper import T2IAdapterWrapper
 
+# 🎛️ CONTROLNET (per-step geometry lock: depth / pose / canny)
+from modules.controlnet_wrapper import ControlNetWrapper, ControlNetConfig
+
 logger = logging.getLogger(__name__)
 
 class SDXLVideoPipeline(DiffusionPipeline):
@@ -83,6 +86,11 @@ class SDXLVideoPipeline(DiffusionPipeline):
         # ---------------------------------------------------
         self.t2i_adapter: Optional[T2IAdapterWrapper] = None
 
+        # ---------------------------------------------------
+        # 🎛️ CONTROLNET (her iki modda da opsiyonel)
+        # ---------------------------------------------------
+        self.controlnet: Optional[ControlNetWrapper] = None
+
         logger.info(f"SDXLVideoPipeline initialized on {self.device_name}. TSM Enabled: {self.enable_tsm}")
 
     def load_ip_adapter(self, local_path: Optional[str] = None, scale: float = 0.8) -> bool:
@@ -140,6 +148,36 @@ class SDXLVideoPipeline(DiffusionPipeline):
         if not success:
             self.t2i_adapter = None
         return success
+
+    def load_controlnet(self, config: Optional[Dict[str, Any]] = None, dtype: Optional[torch.dtype] = None) -> bool:
+        """
+        Loads one or more SDXL ControlNets (Multi-ControlNet = residuals are summed).
+        `config` is the `controlnet:` section of configs/runtime.yaml.
+        """
+        if not ControlNetWrapper.unet_supports_controlnet(self.unet):
+            self.controlnet = None
+            return False
+        resolved_dtype = dtype or next(self.unet.parameters()).dtype
+        self.controlnet = ControlNetWrapper(
+            ControlNetConfig.from_dict(config),
+            device=self.device_name,
+            dtype=resolved_dtype,
+        )
+        success = self.controlnet.load()
+        if not success:
+            self.controlnet = None
+        return success
+
+    def _prepare_controlnet_maps(self, reference_image, driving_frames, width, height):
+        """Runs the preprocessors once per video. Returns (ref_maps, driving_maps)."""
+        if self.controlnet is None:
+            return None, None
+        self.controlnet.reset()
+        ref_maps = self.controlnet.build_condition_maps([reference_image], width, height) if reference_image is not None else None
+        drv_maps = self.controlnet.build_condition_maps(driving_frames, width, height) if driving_frames else None
+        if ref_maps is None and drv_maps is None and self.controlnet.config.source not in ("previous_frame", "hybrid"):
+            logger.info("[ControlNet] Koşul görüntüsü yok (referans/driving video verilmedi) → bu koşuda kapalı.")
+        return ref_maps, drv_maps
 
     def _resolve_t2i_residuals(
         self,
@@ -221,6 +259,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
         ip_adapter_image_embeds: Optional[torch.Tensor] = None,  # I2V: Face embeds (1, 4, 2048)
         t2i_residuals: Optional[List[torch.Tensor]] = None,  # I2V: T2I-Adapter residuals from reference
         start_timestep: Optional[int] = None,
+        controlnet_reference_image: Optional[Image.Image] = None,   # ControlNet: reference condition source
+        controlnet_driving_frames: Optional[List[Image.Image]] = None,  # ControlNet: per-frame driving video
         **kwargs: Any,
     ):
         # Güvenlik kontrolü: TSM açıksa num_frames, tsm_num_frames ile aynı olmalı
@@ -228,24 +268,28 @@ class SDXLVideoPipeline(DiffusionPipeline):
             logger.warning(f"TSM is enabled for {self.tsm_num_frames} frames, but generation requested {num_frames}. Overriding request.")
             num_frames = self.tsm_num_frames
 
+        cn_ref_maps, cn_drv_maps = self._prepare_controlnet_maps(
+            controlnet_reference_image, controlnet_driving_frames, width, height
+        )
+
         if self.enable_tsm:
             return self._generate_batch_temporal(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
                 num_inference_steps, guidance_scale, generator, ip_adapter_weights,
-                t2i_residuals,
+                t2i_residuals, cn_ref_maps, cn_drv_maps,
             )
         else:
             return self._generate_frame_by_frame(
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
                 num_inference_steps, guidance_scale, generator, target_driving_frames,
                 ip_adapter_weights, initial_latent, ip_adapter_image_embeds,
-                t2i_residuals,start_timestep,
+                t2i_residuals,start_timestep, cn_ref_maps, cn_drv_maps,
             )
 
     # =========================================================================
     # MOD 1: ISHTIAQ'S BATCH TEMPORAL (TSM) MİMARİSİ
     # =========================================================================
-    def _generate_batch_temporal(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, ip_weights, t2i_residuals=None):
+    def _generate_batch_temporal(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, ip_weights, t2i_residuals=None, cn_ref_maps=None, cn_drv_maps=None):
         logger.info(f"Running in Batch Temporal (TSM) Mode for {num_frames} frames...")
         device = self._execution_device
         batch_size = 1
@@ -255,16 +299,19 @@ class SDXLVideoPipeline(DiffusionPipeline):
         curr_prompt_embeds = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
         curr_added_cond = added_cond_kwargs[0] if isinstance(added_cond_kwargs, list) else added_cond_kwargs
         
-        # TSM mimarisinde prompt tensorleri T kere çoğaltılır
-        curr_prompt_embeds = curr_prompt_embeds.repeat(num_frames, 1, 1)
-        curr_added_cond["text_embeds"] = curr_added_cond["text_embeds"].repeat(num_frames, 1)
-        curr_added_cond["time_ids"] = curr_added_cond["time_ids"].repeat(num_frames, 1)
+        # TSM mimarisinde prompt tensorleri T kere çoğaltılır.
+        # inference.py embed'leri CFG için zaten [uncond, cond] (batch 2) verir; latent girişi de
+        # [lat_0..lat_{T-1}, lat_0..lat_{T-1}] olduğundan sıra [uncond×T, cond×T] olmalı.
+        def _expand(x: torch.Tensor) -> torch.Tensor:
+            reps = (num_frames,) + (1,) * (x.dim() - 1)
+            if x.shape[0] == 2:
+                uncond, cond = x.chunk(2)
+                return torch.cat([uncond.repeat(*reps), cond.repeat(*reps)], dim=0) if do_cfg else cond.repeat(*reps)
+            x = x.repeat(*reps)
+            return torch.cat([x, x], dim=0) if do_cfg else x
 
-        # CFG için kopyalama
-        if do_cfg:
-            curr_prompt_embeds = torch.cat([curr_prompt_embeds, curr_prompt_embeds], dim=0)
-            curr_added_cond["text_embeds"] = torch.cat([curr_added_cond["text_embeds"], curr_added_cond["text_embeds"]], dim=0)
-            curr_added_cond["time_ids"] = torch.cat([curr_added_cond["time_ids"], curr_added_cond["time_ids"]], dim=0)
+        curr_prompt_embeds = _expand(curr_prompt_embeds)
+        curr_added_cond = {k: _expand(v) for k, v in curr_added_cond.items()}
 
         # Tüm kareler için tek bir büyük latents tensörü (B*T, 4, H, W)
         latents = torch.randn(
@@ -288,9 +335,22 @@ class SDXLVideoPipeline(DiffusionPipeline):
             batch_size=num_frames,
         )
 
-        for t in self.scheduler.timesteps:
+        cn_cond = (
+            self.controlnet.conditions_for_batch(num_frames, cn_ref_maps, cn_drv_maps)
+            if self.controlnet is not None else None
+        )
+        num_steps = len(self.scheduler.timesteps)
+
+        for step_idx, t in enumerate(self.scheduler.timesteps):
             latent_input = torch.cat([latents, latents], dim=0) if do_cfg else latents
             latent_input = self.scheduler.scale_model_input(latent_input, t)
+
+            cn_down, cn_mid = (None, None)
+            if cn_cond is not None:
+                cn_down, cn_mid = self.controlnet.get_residuals(
+                    latent_input, t, curr_prompt_embeds, curr_added_cond, cn_cond,
+                    step_idx, num_steps, do_cfg,
+                )
 
             noise_pred = self.unet(
                 latent_input,
@@ -299,6 +359,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 added_cond_kwargs=curr_added_cond,
                 cross_attention_kwargs=cross_attention_kwargs,
                 down_intrablock_additional_residuals=T2IAdapterWrapper.clone_residuals(t2i_cfg_residuals),
+                down_block_additional_residuals=cn_down,
+                mid_block_additional_residual=cn_mid,
             ).sample
 
             if do_cfg:
@@ -312,7 +374,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
     # =========================================================================
     # MOD 2: ALFAI'S FRAME-BY-FRAME (FLOW + LOSS) MİMARİSİ
     # =========================================================================
-    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None, t2i_residuals=None, start_timestep=None):
+    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None, t2i_residuals=None, start_timestep=None, cn_ref_maps=None, cn_drv_maps=None):
         logger.info(f"Running in Frame-by-Frame (Flow & Loss) Mode for {num_frames} frames...")
         device = self._execution_device
         video_frames: List[Image.Image] = []
@@ -366,14 +428,31 @@ class SDXLVideoPipeline(DiffusionPipeline):
             logger.info(f"[T2I] Frame 0: T2I-Adapter aktif (type={self.t2i_adapter.condition_type}, scale={self.t2i_adapter.scale:.2f}).")
 
         frame0_timesteps = self.scheduler.timesteps
-        logger.info(f"[I2V] Frame 0: {len(frame0_timesteps)}/{len(self.scheduler.timesteps)} adım, ilk t={int(frame0_timesteps[0])}")
         if initial_latent is not None and start_timestep is not None:
             frame0_timesteps = frame0_timesteps[frame0_timesteps <= start_timestep]
-        
 
-        for t in frame0_timesteps:
+        # ControlNet: frame 0 koşulu (referans veya driving_video[0])
+        frame0_cn = (
+            self.controlnet.condition_for_frame(0, cn_ref_maps, cn_drv_maps, None, width, height)
+            if self.controlnet is not None else None
+        )
+        if frame0_cn is not None:
+            units = ", ".join(u.name for u in self.controlnet.units)
+            logger.info(f"[ControlNet] Frame 0: aktif ({units}).")
+        frame0_num_steps = len(frame0_timesteps)
+        logger.info(f"Frame 0: {frame0_num_steps}/{len(self.scheduler.timesteps)} adım, ilk t={int(frame0_timesteps[0])}")
+
+        for step_idx, t in enumerate(frame0_timesteps):
             latent_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_input = self.scheduler.scale_model_input(latent_input, t)
+
+            cn_down, cn_mid = (None, None)
+            if frame0_cn is not None:
+                # ControlNet'e IP-Adapter yüz token'ları DEĞİL, sadece metin embed'leri gider
+                cn_down, cn_mid = self.controlnet.get_residuals(
+                    latent_input, t, curr_prompt_embeds, curr_added_cond, frame0_cn,
+                    step_idx, frame0_num_steps, do_cfg,
+                )
 
             noise_pred = self.unet(
                 latent_input, t,
@@ -381,6 +460,8 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 added_cond_kwargs=curr_added_cond,
                 cross_attention_kwargs=cross_attention_kwargs,
                 down_intrablock_additional_residuals=T2IAdapterWrapper.clone_residuals(frame0_t2i),
+                down_block_additional_residuals=cn_down,
+                mid_block_additional_residual=cn_mid,
             ).sample
 
             if do_cfg:
@@ -446,6 +527,12 @@ class SDXLVideoPipeline(DiffusionPipeline):
                     ref_residuals=t2i_residuals,
                     prev_image_pil=prev_image_pil,
                 ),
+                controlnet=self.controlnet,
+                controlnet_cond=(
+                    self.controlnet.condition_for_frame(i, cn_ref_maps, cn_drv_maps, prev_image_pil, width, height)
+                    if self.controlnet is not None else None
+                ),
+                controlnet_text_embeds=curr_prompt_embeds,
             )
 
             video_frames.extend(self.decode_latents(next_latents))

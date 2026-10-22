@@ -24,3 +24,30 @@ t2i_adapter:
   source: "hybrid"        # reference | previous_frame | hybrid
   canny_low: 100
   canny_high: 200
+
+# ControlNet Ayarları (her denoising adımında çalışır; T2I-Adapter'dan güçlü, daha pahalı)
+# Birden fazla birim (unit) verilirse residual'lar toplanır (Multi-ControlNet).
+# type: depth | canny | pose     variant: small (6–8 GB) | full (12 GB+; pose yalnızca full)
+# source: auto = driving video varsa onu, yoksa referans görseli kullanır
+#         reference | driving_video | previous_frame | hybrid
+controlnet:
+  enabled: true
+  source: "auto"
+  guess_mode: false         # true: prompt'suz yapı takibi, uncond tarafa residual verilmez
+  temporal_smoothing: 0.3   # Koşul haritalarında kareler arası EMA (0 = kapalı); depth/canny titremesini azaltır
+  offload: "none"           # none | sequential (VRAM < 8 GB ise; yavaşlatır)
+  canny_low: 100
+  canny_high: 200
+  units:
+    - type: "depth"
+      variant: "small"
+      local_path: null      # Yerel ControlNet klasörü (config.json + safetensors), yoksa HuggingFace
+      scale: 0.5            # conditioning_scale (0.4–0.7 önerilir; yüksekse doku bozulur)
+      guidance_start: 0.0
+      guidance_end: 0.8     # Son %20 adımda kapalı → ince detayı UNet serbestçe üretir
+    # - type: "pose"
+    #   variant: "full"
+    #   local_path: null
+    #   scale: 0.6
+    #   guidance_start: 0.0
+    #   guidance_end: 0.7

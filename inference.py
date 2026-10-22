@@ -22,6 +22,7 @@ from utils.model_utils import get_device, flush_vram
 from pipelines.video_pipeline import SDXLVideoPipeline
 from modules.interpolation.rife import RIFEInterpolator
 from modules.inversion.ddim_inversion import DDIMInversion
+from modules.controlnet_wrapper import load_driving_frames
 
 # --- ALFAI CUSTOM UNET IMPORT ---
 try:
@@ -173,6 +174,17 @@ class VideoGenerator:
         else:
             logger.info("T2I-Adapter config'de devre dışı bırakılmış.")
 
+        # ControlNet: her adımda çalışan geometri kilidi (depth/pose/canny, çoklu birim)
+        cn_cfg = self.config.get("controlnet", {})
+        if cn_cfg.get("enabled", False):
+            success = self.pipeline.load_controlnet(config=cn_cfg, dtype=self.dtype)
+            if success:
+                logger.info("✅ ControlNet aktif. Adım-bazlı geometri kilidi hazır.")
+            else:
+                logger.warning("⚠️ ControlNet yüklenemedi. Bu koşuda ControlNet kapalı.")
+        else:
+            logger.info("ControlNet config'de devre dışı bırakılmış.")
+
         logger.info("✅ Models loaded successfully")
 
     # --------------------------------------------------------
@@ -262,6 +274,7 @@ class VideoGenerator:
         seed: Optional[int] = None,
         reference_image_path: Optional[str] = None,  # I2V: tek referans fotoğraf
         ip_adapter_scale: float = 0.0,
+        control_video_path: Optional[str] = None,  # ControlNet: hareket kaynağı (pose/depth dizisi)
     ) -> str:
         generator = (
             torch.Generator(device=self.device).manual_seed(seed)
@@ -286,6 +299,7 @@ class VideoGenerator:
         target_driving_frames = None
         ip_adapter_image_embeds = None
         t2i_residuals = None
+        ref_img = None
 
         if reference_image_path and Path(reference_image_path).exists():
             import numpy as _np  # zaten import'lu ama explicit olsun
@@ -343,6 +357,16 @@ class VideoGenerator:
                 logger.warning(f"⚠️ Referans fotoğraf bulunamadı: {reference_image_path} — T2V modunda devam ediliyor.")
             logger.info("🎬 T2V Modu: Saf prompt'tan üretim yapılıyor.")
 
+        # ControlNet: driving video (varsa) her kare için ayrı koşul haritası verir
+        controlnet_driving_frames = None
+        if control_video_path:
+            if self.pipeline.controlnet is None:
+                logger.warning("⚠️ --control-video verildi ama ControlNet yüklü değil (config: controlnet.enabled).")
+            elif Path(control_video_path).exists():
+                controlnet_driving_frames = load_driving_frames(control_video_path, num_frames, width, height)
+            else:
+                logger.warning(f"⚠️ Driving video bulunamadı: {control_video_path}")
+
         # ----------------------------------------------------
         # RUN SDXL VIDEO PIPELINE
         # ----------------------------------------------------
@@ -361,6 +385,8 @@ class VideoGenerator:
             ip_adapter_image_embeds=ip_adapter_image_embeds,  # None ise devre dışı
             t2i_residuals=t2i_residuals,  # None ise T2I-Adapter frame 0'da kapalı; P-frame'de previous_frame/hybrid çalışır
             start_timestep=start_timestep,
+            controlnet_reference_image=ref_img,
+            controlnet_driving_frames=controlnet_driving_frames,
         )
 
         frames = output.frames

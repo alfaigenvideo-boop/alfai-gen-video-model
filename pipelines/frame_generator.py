@@ -28,12 +28,17 @@ def generate_next_frame(
     loss_scale: float = 0.5,
     initial_latent: Optional[torch.Tensor] = None,  # SLERP: I2V P-frame başlangıç latent'i
     down_intrablock_additional_residuals: Optional[List[torch.Tensor]] = None,  # T2I-Adapter residuals
+    # ControlNet: wrapper + this frame's condition maps + TEXT-ONLY embeds (no IP-Adapter tokens)
+    controlnet: Optional[Any] = None,
+    controlnet_cond: Optional[List[torch.Tensor]] = None,
+    controlnet_text_embeds: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Generates a single predictive frame (P-Frame) using Flow-Guided Blending 
     and Loss-Guided Diffusion Optimization (Universal Guidance).
-    Includes support for IP-Adapter via cross_attention_kwargs and
-    T2I-Adapter via down_intrablock_additional_residuals.
+    Includes support for IP-Adapter via cross_attention_kwargs,
+    T2I-Adapter via down_intrablock_additional_residuals and
+    ControlNet via down_block_additional_residuals + mid_block_additional_residual.
     """
     
     # 1. Başlangıç Gürültüsü (Latent t_T)
@@ -51,6 +56,10 @@ def generate_next_frame(
 
     scheduler.set_timesteps(num_inference_steps, device=device)
     do_classifier_free_guidance = guidance_scale > 1.0
+    use_controlnet = controlnet is not None and controlnet_cond is not None
+    if use_controlnet and controlnet_text_embeds is None:
+        controlnet_text_embeds = prompt_embeds
+    num_steps = len(scheduler.timesteps)
 
     # 2. Denoising Loop (Adım Adım Gürültü Kaldırma ve Optimizasyon)
     for i, t in enumerate(tqdm(scheduler.timesteps, desc="Generating Frame", leave=True)):
@@ -83,6 +92,19 @@ def generate_next_frame(
             if down_intrablock_additional_residuals is not None:
                 t2i_residuals = [r.clone() for r in down_intrablock_additional_residuals]
 
+            cn_down, cn_mid = None, None
+            if use_controlnet:
+                cn_down, cn_mid = controlnet.get_residuals(
+                    latent_model_input=latent_model_input,
+                    t=t,
+                    text_embeds=controlnet_text_embeds,
+                    added_cond_kwargs=added_cond_kwargs,
+                    cond_images=controlnet_cond,
+                    step_index=i,
+                    num_steps=num_steps,
+                    do_cfg=do_classifier_free_guidance,
+                )
+
             noise_pred = unet(
                 latent_model_input,
                 t,
@@ -90,6 +112,8 @@ def generate_next_frame(
                 added_cond_kwargs=added_cond_kwargs,
                 cross_attention_kwargs=cross_attention_kwargs,
                 down_intrablock_additional_residuals=t2i_residuals,
+                down_block_additional_residuals=cn_down,
+                mid_block_additional_residual=cn_mid,
                 return_dict=False
             )[0]
 

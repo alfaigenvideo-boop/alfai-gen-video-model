@@ -12,6 +12,8 @@ env/
 
 .vscode/
 outputs/
-models/
+# Model ağırlıkları ignore, ama models/unet/*.py kaynak kodu depoda kalmalı
+models/*
+!models/unet/
 *.safetensors
 *.pth

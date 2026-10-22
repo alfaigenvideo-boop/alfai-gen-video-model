@@ -54,7 +54,7 @@ Alfai, zamansal tutarlılığı 9 ayrı tekniğin **katmanlı entegrasyonu** ile
 Girdi Görseli
   → DDIM Inversion (görsel → latent uzayı)
   → IP-Adapter FaceID (kimlik ankrajı, w=0.9)          [⚠️ Yapım Aşamasında]
-  → ControlNet Pose + Depth (geometri sabitleyici)      [⚠️ Yapım Aşamasında]
+  → ControlNet Depth/Pose/Canny (her adımda geometri kilidi; kaynak: referans veya driving video)
   → SDXL UNet + TSM (temporal shift aktif)
   → frame₀
 ```
@@ -65,7 +65,7 @@ frame_{t-1}
   → RAFT Optical Flow (ileri + geri akış)
   → Latent Warp + Occlusion Mask
   → Residual Inpainting (sadece değişen bölgeler)
-  → ControlNet (aktif)                                  [⚠️ Yapım Aşamasında]
+  → ControlNet (driving video karesi i / önceki kare haritası, EMA yumuşatmalı)
   → IP-Adapter (azalan ağırlık, w azalıyor)             [⚠️ Yapım Aşamasında]
   → TSM katmanları (mid-block)
   → frame_{t}
@@ -88,7 +88,7 @@ frame_{t-1}
 |---|---------|--------|-------|--------|
 | 1 | **DDIM Inversion** | Partial DDIM (stop_at_t) | ✅ Tamamlandı | `modules/inversion/ddim_inversion.py` |
 | 2 | **Latent İnterpolasyon** | LERP / SLERP / Spline | ❌ Eksik | Dosya hiç oluşturulmamış |
-| 3 | **ControlNet** | Pose + Depth guidance | ❌ Eksik | Wrapper boş (`0 byte`) |
+| 3 | **ControlNet** | Depth / Pose / Canny, Multi-ControlNet | ✅ Tamamlandı | `modules/controlnet_wrapper.py` — guidance penceresi, guess mode, driving video |
 | 4 | **IP-Adapter FaceID** | FaceID w/ azalan ağırlık | ❌ Eksik | Wrapper boş (`0 byte`) |
 | 5 | **Prompt-to-Prompt** | Soft prompt blending | ⚠️ Kısmi | String-level var; attention-level yok |
 | 6 | **Optical Flow + Warp** | RAFT / GMFlow + Latent Warp | ✅ Tamamlandı | İleri-geri tutarlılık kontrolü dahil |
@@ -96,10 +96,10 @@ frame_{t-1}
 | 8 | **Loss Guidance** | CLIP + VGG Perceptual + ResNet ID | ✅ Tamamlandı | ID loss için ArcFace önerilir |
 | 9 | **RIFE Post-process** | Frame interpolation | ✅ Tamamlandı | Opsiyonel, default kapalı |
 
-### Genel İlerleme: `5/9 bileşen tamamlandı`
+### Genel İlerleme: `6/9 bileşen tamamlandı`
 
 ```
-✅✅❌❌⚠️✅✅✅✅
+✅❌✅❌⚠️✅✅✅✅
  1  2  3  4  5  6  7  8  9
 ```
 
@@ -149,6 +149,18 @@ python main.py --prompt "A cinematic shot of a futuristic city at night, golden 
 
 Çıktı: `outputs/videos/raw_output.mp4`
 
+### ControlNet ile Üretim
+
+```bash
+# Referans görselin derinlik (depth) haritası her karede geometriyi kilitler
+python main.py -p "a woman walking in a park, cinematic" -r ref.jpg
+
+# Hareketi bir driving video belirler (her kare için ayrı depth/pose haritası)
+python main.py -p "a woman walking in a park, cinematic" -r ref.jpg -c driving.mp4
+```
+
+Ayarlar `configs/runtime.yaml` → `controlnet:` bölümünde (birimler, `scale`, `guidance_start/end`, `source`, `temporal_smoothing`).
+
 ---
 
 ## Proje Yapısı
@@ -183,7 +195,7 @@ alfai-gen-video-model/
 │   ├── interpolation/
 │   │   └── rife.py             # RIFE post-process wrapper
 │   ├── prompt_to_prompt.py     # Prompt blending & IP-Adapter ağırlık takvimi
-│   ├── controlnet_wrapper.py   # [❌ Henüz yazılmadı]
+│   ├── controlnet_wrapper.py   # SDXL ControlNet (Multi-ControlNet, driving video, EMA)
 │   └── ip_adapter_wrapper.py   # [❌ Henüz yazılmadı]
 │
 ├── pipelines/
@@ -203,7 +215,7 @@ alfai-gen-video-model/
 ## Yol Haritası
 
 ### 🔴 Kritik (Çekirdek Özellik Eksikleri)
-- [ ] `modules/controlnet_wrapper.py` — SDXL-ControlNet (pose + depth) implementasyonu
+- [x] `modules/controlnet_wrapper.py` — SDXL-ControlNet (pose + depth + canny) implementasyonu
 - [ ] `modules/ip_adapter_wrapper.py` — IP-Adapter FaceID entegrasyonu + azalan ağırlık takvimi
 - [ ] `modules/interpolation/latent_interpolation.py` — SLERP / Spline keyframe interpolasyonu
 

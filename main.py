@@ -35,6 +35,8 @@ def main():
                         help="Üretilecek video için metin (prompt)")
     parser.add_argument("-r", "--ref", type=str, default=None,
                         help="[I2V Modu] Referans fotoğraf yolu. Verilirse flow anchor olarak kullanılır.")
+    parser.add_argument("-c", "--control-video", type=str, default=None,
+                        help="[ControlNet] Hareket kaynağı video (pose/depth haritaları her kare için buradan çıkarılır).")
     parser.add_argument("--fast", action="store_true",
                         help="Hızlı test modu: 4 kare, 5 adım, 512x512 — yaklaşık 2-3 dakika")
     parser.add_argument("--steps", type=int, default=None,
@@ -74,6 +76,7 @@ def main():
         num_inference_steps=steps,
         seed=config.get("runtime", {}).get("seed", None),
         reference_image_path=args.ref,
+        control_video_path=args.control_video,
     )
 
     logger.info(f"✅ Video başarıyla kaydedildi: {output_path}")
