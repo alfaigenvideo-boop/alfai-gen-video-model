@@ -277,7 +277,7 @@ class IPAdapterFaceID:
         unet_sd = self.unet.state_dict()
 
         # Find all cross-attention layers in UNet
-        for name in self.unet.attn_processors.keys():
+        for idx, name in enumerate(self.unet.attn_processors.keys()): 
             cross_attention_dim = None
             if name.endswith("attn1.processor"):
                 # Self-attention — keep original
@@ -312,9 +312,12 @@ class IPAdapterFaceID:
             ip_key_k = f"{key_prefix}.to_k_ip.weight"
             ip_key_v = f"{key_prefix}.to_v_ip.weight"
 
-            if ip_key_k in adapter_state_dict:
-                proc.to_k_ip.weight = nn.Parameter(adapter_state_dict[ip_key_k].to(self.device))
-                proc.to_v_ip.weight = nn.Parameter(adapter_state_dict[ip_key_v].to(self.device))
+            ip_key_k = f"{idx}.to_k_ip.weight"
+            ip_key_v = f"{idx}.to_v_ip.weight"
+            if ip_key_k not in adapter_state_dict or ip_key_v not in adapter_state_dict:
+                raise KeyError(f"IP-Adapter ağırlığı bulunamadı: {ip_key_k} (katman: {name})")
+            proc.to_k_ip.weight = nn.Parameter(adapter_state_dict[ip_key_k].to(self.device))
+            proc.to_v_ip.weight = nn.Parameter(adapter_state_dict[ip_key_v].to(self.device))
 
             attn_procs[name] = proc
 

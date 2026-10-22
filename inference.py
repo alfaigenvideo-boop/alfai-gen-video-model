@@ -282,6 +282,7 @@ class VideoGenerator:
         # I2V: Referans fotoğraf varsa DDIM inversion + IP-Adapter face embeds
         # --------------------------------------------------------
         initial_latent = None
+        start_timestep = None
         target_driving_frames = None
         ip_adapter_image_embeds = None
         t2i_residuals = None
@@ -300,12 +301,13 @@ class VideoGenerator:
             ref_tensor_flow = torch.from_numpy(ref_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
 
             # DDIM Inversion
-            logger.info("🔄 DDIM Inversion çalıştırılıyor (stop_at_t=600)...")
+            logger.info("🔄 DDIM Inversion çalıştırılıyor (stop_at_t=420)...")
             initial_latent = self.inverter.invert(
                 image=ref_tensor_vae,
                 num_steps=num_inference_steps,
                 stop_at_t=420,   # 600→420: ifade ve yapı daha iyi korunur
             )
+            start_timestep = self.inverter.reached_t
             logger.info("✅ Referans görsel latent uzayına dönüştürüldü.")
 
             # IP-Adapter FaceID: Yüz embedding çıkar
@@ -314,7 +316,7 @@ class VideoGenerator:
                 and self.pipeline.face_extractor is not None
                 and self.pipeline.face_extractor.app is not None
             ):
-                ref_img_uint8 = (np.array(ref_img)).astype("uint8")
+                ref_img_uint8 = np.array(ref_img).astype("uint8")[:, :, ::-1].copy()   # RGB -> BGR
                 face_embedding = self.pipeline.face_extractor.extract(ref_img_uint8)
                 if face_embedding is not None:
                     ip_adapter_image_embeds = self.pipeline.ip_adapter.get_image_embeds(face_embedding)
@@ -358,6 +360,7 @@ class VideoGenerator:
             initial_latent=initial_latent,
             ip_adapter_image_embeds=ip_adapter_image_embeds,  # None ise devre dışı
             t2i_residuals=t2i_residuals,  # None ise T2I-Adapter frame 0'da kapalı; P-frame'de previous_frame/hybrid çalışır
+            start_timestep=start_timestep,
         )
 
         frames = output.frames

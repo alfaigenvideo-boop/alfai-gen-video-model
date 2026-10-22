@@ -29,8 +29,8 @@ class LatentWarper:
 
     def _create_standard_grid(self, height: int, width: int, dtype: torch.dtype) -> torch.Tensor:
         """Creates a normalized identity grid for grid_sampling."""
-        x_coords = torch.linspace(self._coord_min, self._coord_max, width, device=self.device, dtype=dtype)
-        y_coords = torch.linspace(self._coord_min, self._coord_max, height, device=self.device, dtype=dtype)
+        x_coords = ((torch.arange(width, device=self.device, dtype=torch.float32) * 2 + 1) / width - 1).to(dtype)
+        y_coords = ((torch.arange(height, device=self.device, dtype=torch.float32) * 2 + 1) / height - 1).to(dtype)
         grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
         return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # [1, H, W, 2]
 

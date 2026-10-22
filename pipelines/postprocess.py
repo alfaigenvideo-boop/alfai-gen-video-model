@@ -14,7 +14,7 @@ class RIFEInterpolator:
     """
     def __init__(self, config: dict):
         self.rife_path = config["rife_path"]
-        self.exp = config.get("exp", 2) # FPS'i kaç kat artıracağı (örn: 2 = 8fps -> 16fps)
+        self.exp = config.get("exp", 2) 
         self.fp16 = config.get("fp16", True)
         self.skip = config.get("skip", True)
         self.gpu_id = config.get("gpu_id", 0)
@@ -25,6 +25,10 @@ class RIFEInterpolator:
 
         output_video = input_video.replace(".mp4", "_smooth.mp4")
         inference_script = os.path.join(self.rife_path, "inference_video.py")
+
+        if not os.path.exists(inference_script):
+            logger.warning(f"RIFE betiği bulunamadı: {inference_script}. İnterpolasyon atlanıyor.")
+            return input_video
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)

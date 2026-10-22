@@ -220,6 +220,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
         initial_latent: Optional[torch.Tensor] = None,   # I2V: DDIM inversion çıktısı
         ip_adapter_image_embeds: Optional[torch.Tensor] = None,  # I2V: Face embeds (1, 4, 2048)
         t2i_residuals: Optional[List[torch.Tensor]] = None,  # I2V: T2I-Adapter residuals from reference
+        start_timestep: Optional[int] = None,
         **kwargs: Any,
     ):
         # Güvenlik kontrolü: TSM açıksa num_frames, tsm_num_frames ile aynı olmalı
@@ -238,7 +239,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
                 prompt_embeds, added_cond_kwargs, num_frames, width, height, 
                 num_inference_steps, guidance_scale, generator, target_driving_frames,
                 ip_adapter_weights, initial_latent, ip_adapter_image_embeds,
-                t2i_residuals,
+                t2i_residuals,start_timestep,
             )
 
     # =========================================================================
@@ -311,7 +312,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
     # =========================================================================
     # MOD 2: ALFAI'S FRAME-BY-FRAME (FLOW + LOSS) MİMARİSİ
     # =========================================================================
-    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None, t2i_residuals=None):
+    def _generate_frame_by_frame(self, prompt_embeds, added_cond_kwargs, num_frames, width, height, steps, cfg, generator, target_driving_frames, ip_weights, initial_latent=None, ip_adapter_image_embeds=None, t2i_residuals=None, start_timestep=None):
         logger.info(f"Running in Frame-by-Frame (Flow & Loss) Mode for {num_frames} frames...")
         device = self._execution_device
         video_frames: List[Image.Image] = []
@@ -364,7 +365,11 @@ class SDXLVideoPipeline(DiffusionPipeline):
         if frame0_t2i is not None:
             logger.info(f"[T2I] Frame 0: T2I-Adapter aktif (type={self.t2i_adapter.condition_type}, scale={self.t2i_adapter.scale:.2f}).")
 
-        for t in self.scheduler.timesteps:
+        frame0_timesteps = self.scheduler.timesteps
+        if initial_latent is not None and start_timestep is not None:
+            frame0_timesteps = frame0_timesteps[frame0_timesteps <= start_timestep]
+
+        for t in frame0_timesteps:
             latent_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_input = self.scheduler.scale_model_input(latent_input, t)
 

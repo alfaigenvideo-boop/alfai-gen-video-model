@@ -51,6 +51,7 @@ class DDIMInversion:
         
         logger.info(f"Inversion çalışıyor... Hedef t={stop_at_t}")
 
+        self.reached_t = 0 
         for i, t in enumerate(timesteps_list):
             # Eğer mevcut zaman adımı, hedefimizden büyükse dur.
             if t.item() > stop_at_t:
@@ -67,6 +68,7 @@ class DDIMInversion:
             if i < len(timesteps_list) - 1:
                 next_t = timesteps_list[i + 1]
                 alpha_prod_t_next = self.scheduler.alphas_cumprod.to(self.device)[next_t.long()]
+                self.reached_t = int(next_t.item())
             else:
                 alpha_prod_t_next = torch.tensor(0.001, device=self.device)
 
