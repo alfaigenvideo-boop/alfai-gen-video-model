@@ -366,8 +366,10 @@ class SDXLVideoPipeline(DiffusionPipeline):
             logger.info(f"[T2I] Frame 0: T2I-Adapter aktif (type={self.t2i_adapter.condition_type}, scale={self.t2i_adapter.scale:.2f}).")
 
         frame0_timesteps = self.scheduler.timesteps
+        logger.info(f"[I2V] Frame 0: {len(frame0_timesteps)}/{len(self.scheduler.timesteps)} adım, ilk t={int(frame0_timesteps[0])}")
         if initial_latent is not None and start_timestep is not None:
             frame0_timesteps = frame0_timesteps[frame0_timesteps <= start_timestep]
+        
 
         for t in frame0_timesteps:
             latent_input = torch.cat([latents] * 2) if do_cfg else latents

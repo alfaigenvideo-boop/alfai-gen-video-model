@@ -17,7 +17,7 @@ ip_adapter:
 # type: canny (test, ekstra detector yok) | depth | pose | lineart | sketch
 # source: hybrid = frame 0 referans, sonraki kareler previous frame
 t2i_adapter:
-  enabled: true
+  enabled: false          # false yaparak tamamen devre dışı bırakılabilir
   type: "canny"
   local_path: null        # Yerel adapter klasörü varsa yolu gir, yoksa HuggingFace
   scale: 0.8              # Residual gücü (0.6–0.9 önerilir)

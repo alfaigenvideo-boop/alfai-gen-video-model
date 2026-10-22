@@ -272,57 +272,40 @@ class IPAdapterFaceID:
             return False
 
     def _inject_processors(self, adapter_state_dict: dict):
-        """Replaces UNet cross-attention processors with IP-Adapter aware ones."""
+        """UNet'in cross-attention (attn2) katmanlarına IP-Adapter işlemcisi takar."""
         attn_procs = {}
-        unet_sd = self.unet.state_dict()
+        n_ip = 0
 
-        # Find all cross-attention layers in UNet
-        for idx, name in enumerate(self.unet.attn_processors.keys()): 
-            cross_attention_dim = None
-            if name.endswith("attn1.processor"):
-                # Self-attention — keep original
-                attn_procs[name] = self.unet.attn_processors[name]
+        for idx, name in enumerate(self.unet.attn_processors.keys()):
+            if not name.endswith("attn2.processor"):
+                attn_procs[name] = self.unet.attn_processors[name]  # self-attention aynen kalır
                 continue
 
-            # Cross-attention — determine hidden size from UNet weights
-            hidden_size = None
-            layer_name = name.split(".processor")[0]
-            for k in unet_sd.keys():
-                if layer_name in k and "to_q.weight" in k:
-                    hidden_size = unet_sd[k].shape[0]
-                    break
-                if layer_name in k and "to_q" in k:
-                    cross_attention_dim = unet_sd[k].shape[1]
+            attn = self.unet.get_submodule(name[: -len(".processor")])
+            hidden_size = attn.to_q.out_features
+            cross_dim = attn.to_k.in_features
 
-            if hidden_size is None:
-                attn_procs[name] = self.unet.attn_processors[name]
-                continue
-
-            cross_attention_dim = cross_attention_dim or self.CROSS_ATTENTION_DIM
+            k_key, v_key = f"{idx}.to_k_ip.weight", f"{idx}.to_v_ip.weight"
+            if k_key not in adapter_state_dict or v_key not in adapter_state_dict:
+                raise KeyError(f"IP-Adapter ağırlığı bulunamadı: {k_key} (katman: {name})")
 
             proc = IPAttnProcessor2_0(
                 hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
+                cross_attention_dim=cross_dim,
                 num_tokens=self.NUM_TOKENS,
                 scale=self.scale,
-            ).to(self.device)
-
-            # Load IP-Adapter weights for this layer
-            key_prefix = name.replace(".processor", "")
-            ip_key_k = f"{key_prefix}.to_k_ip.weight"
-            ip_key_v = f"{key_prefix}.to_v_ip.weight"
-
-            ip_key_k = f"{idx}.to_k_ip.weight"
-            ip_key_v = f"{idx}.to_v_ip.weight"
-            if ip_key_k not in adapter_state_dict or ip_key_v not in adapter_state_dict:
-                raise KeyError(f"IP-Adapter ağırlığı bulunamadı: {ip_key_k} (katman: {name})")
-            proc.to_k_ip.weight = nn.Parameter(adapter_state_dict[ip_key_k].to(self.device))
-            proc.to_v_ip.weight = nn.Parameter(adapter_state_dict[ip_key_v].to(self.device))
-
+            )
+            proc.to_k_ip.weight = nn.Parameter(adapter_state_dict[k_key].to(self.device))
+            proc.to_v_ip.weight = nn.Parameter(adapter_state_dict[v_key].to(self.device))
             attn_procs[name] = proc
+            n_ip += 1
+
+        if n_ip == 0:
+            raise RuntimeError("IP-Adapter: hiçbir cross-attention katmanına işlemci takılamadı.")
 
         self.unet.set_attn_processor(attn_procs)
-        logger.info(f"Injected IPAttnProcessor into {sum(1 for v in attn_procs.values() if isinstance(v, IPAttnProcessor2_0))} cross-attention layers.")
+        logger.info(f"Injected IPAttnProcessor into {n_ip} cross-attention layers.")
+
 
     def set_scale(self, scale: float):
         """Dynamically update IP-Adapter scale for all attention processors."""
