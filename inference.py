@@ -308,6 +308,7 @@ class VideoGenerator:
                 stop_at_t=420,   # 600→420: ifade ve yapı daha iyi korunur
             )
             start_timestep = self.inverter.reached_t
+            logger.info(f"start_timestep={start_timestep}")
             logger.info("✅ Referans görsel latent uzayına dönüştürüldü.")
 
             # IP-Adapter FaceID: Yüz embedding çıkar
