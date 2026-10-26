@@ -533,6 +533,7 @@ class SDXLVideoPipeline(DiffusionPipeline):
                     if self.controlnet is not None else None
                 ),
                 controlnet_text_embeds=curr_prompt_embeds,
+                flow_blend_end=getattr(self, "flow_blend_end", 1.0),
             )
 
             video_frames.extend(self.decode_latents(next_latents))

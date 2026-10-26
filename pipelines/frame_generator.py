@@ -32,6 +32,9 @@ def generate_next_frame(
     controlnet: Optional[Any] = None,
     controlnet_cond: Optional[List[torch.Tensor]] = None,
     controlnet_text_embeds: Optional[torch.Tensor] = None,
+    # Akış harmanlamasının uygulandığı adım oranı. 1.0 = her adım (eski davranış: P-kare önceki karenin
+    # kopyasına yakın olur). <1.0 = son adımlarda UNet serbest kalır → ifade/prompt değişimi görünür.
+    flow_blend_end: float = 1.0,
 ) -> torch.Tensor:
     """
     Generates a single predictive frame (P-Frame) using Flow-Guided Blending 
@@ -60,6 +63,7 @@ def generate_next_frame(
     if use_controlnet and controlnet_text_embeds is None:
         controlnet_text_embeds = prompt_embeds
     num_steps = len(scheduler.timesteps)
+    blend_steps = int(round(max(0.0, min(1.0, flow_blend_end)) * num_steps))
 
     # 2. Denoising Loop (Adım Adım Gürültü Kaldırma ve Optimizasyon)
     for i, t in enumerate(tqdm(scheduler.timesteps, desc="Generating Frame", leave=True)):
@@ -67,13 +71,14 @@ def generate_next_frame(
         # --- A. FLOW-GUIDED BLENDING ---
         # Warped latent'a o anki timestep (t) kadar gürültü ekleyip, 
         # inpaint maskesi (1: Üret, 0: Koru) ile birleştiriyoruz.
-        noise = torch.randn_like(previous_latents_warped)
-        warped_latents_noisy = scheduler.add_noise(
-            original_samples=previous_latents_warped, 
-            noise=noise, 
-            timesteps=t.reshape(1,)
-        )
-        latents = (latents * mask) + (warped_latents_noisy * (1.0 - mask))
+        if i < blend_steps:
+            noise = torch.randn_like(previous_latents_warped)
+            warped_latents_noisy = scheduler.add_noise(
+                original_samples=previous_latents_warped, 
+                noise=noise, 
+                timesteps=t.reshape(1,)
+            )
+            latents = (latents * mask) + (warped_latents_noisy * (1.0 - mask))
         
         # --- B. LOSS GUIDANCE OPTIMIZATION (Geri Yayılım) ---
         # Eğer optimizasyon isteniyorsa latents üzerinde gradient akışını açıyoruz

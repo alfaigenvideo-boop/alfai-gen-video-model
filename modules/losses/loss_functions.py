@@ -25,8 +25,8 @@ def build_loss(device: str = "cuda", **kwargs: Any) -> TotalLoss:
         clip = CLIPLoss(device=device)
         id_loss = IDLoss(device=device)
         
-        # PerceptualLoss uses .to(device) based on its current implementation
-        perceptual = PerceptualLoss().to(device)
+        # Cihaz kurucuya verilmeli: varsayılanı "cuda" olduğu için CPU-only ortamda çöküyordu
+        perceptual = PerceptualLoss(device=device)
         
         # Aggregate into TotalLoss wrapper
         total_loss = TotalLoss(

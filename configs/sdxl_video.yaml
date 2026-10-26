@@ -9,4 +9,6 @@ model:
     fps: 8                   # Saniyedeki kare sayısı
     steps: 30                # Inference adım sayısı (kaliteyi artırır)
     guidance_scale: 5.5      # I2V için 5-6 arası optimal (7.5+ yüzü bozar)
+    flow_blend_end: 1.0      # P-karede akış harmanlamasının sürdüğü adım oranı. 1.0 = eski davranış (en kararlı,
+                             # ama kareler neredeyse aynı). İfade/prompt değişimi için 0.5–0.7.
     negative_prompt: "low quality, distortion, watermark, text, blurry, ugly, deformed face, bad anatomy, extra limbs, flickering, temporal inconsistency, jittery, noise, grain, overexposed, underexposed, cartoon, painting, illustration, disfigured, malformed hands"

@@ -23,6 +23,7 @@ from pipelines.video_pipeline import SDXLVideoPipeline
 from modules.interpolation.rife import RIFEInterpolator
 from modules.inversion.ddim_inversion import DDIMInversion
 from modules.controlnet_wrapper import load_driving_frames
+from modules.prompt_to_prompt import PromptBlender
 
 # --- ALFAI CUSTOM UNET IMPORT ---
 try:
@@ -98,13 +99,29 @@ class VideoGenerator:
             logger.info(f"Loading UNet from local file: {unet_path}")
             temp_unet = OfficialUNet.from_single_file(unet_path, torch_dtype=self.dtype)
         else:
-            logger.info(f"UNet local file not found, loading from HuggingFace: {SDXL_HF_ID}")
-            temp_unet = OfficialUNet.from_pretrained(
-                SDXL_HF_ID, subfolder="unet", torch_dtype=self.dtype
-            )
+            logger.info(f"UNet local file not found ({unet_path}), loading from HuggingFace: {SDXL_HF_ID}")
+            temp_unet = None
+            if self.dtype == torch.float16:
+                # fp16 varyantı ~5 GB; varsayılan fp32 dosya ~10 GB ve RAM'e sığmayabilir
+                try:
+                    temp_unet = OfficialUNet.from_pretrained(
+                        SDXL_HF_ID, subfolder="unet", torch_dtype=self.dtype, variant="fp16"
+                    )
+                except Exception as e:
+                    logger.warning(f"fp16 UNet varyantı yüklenemedi, fp32 dosya deneniyor: {e}")
+            if temp_unet is None:
+                temp_unet = OfficialUNet.from_pretrained(
+                    SDXL_HF_ID, subfolder="unet", torch_dtype=self.dtype
+                )
 
         logger.info("Transferring weights to Custom UNet architecture...")
-        custom_unet = CustomUNet(**temp_unet.config)
+        # Özel UNet'i doğrudan hedef dtype'ta kur: fp32 kurulum SDXL için ~10 GB ek RAM ister
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(self.dtype)
+        try:
+            custom_unet = CustomUNet(**temp_unet.config)
+        finally:
+            torch.set_default_dtype(prev_dtype)
         custom_unet.load_state_dict(temp_unet.state_dict(), strict=False)
         custom_unet.to(device=self.device, dtype=self.dtype)
         del temp_unet
@@ -113,7 +130,11 @@ class VideoGenerator:
         # --- VAE ---
         if vae_path and os.path.isfile(vae_path):
             logger.info(f"Loading VAE from local file: {vae_path}")
-            vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=self.dtype).to(self.device)
+            # config verilmezse diffusers SD 1.5 VAE config'ini tahmin ediyor (scaling_factor 0.18215);
+            # SDXL için doğru değer 0.13025 — yanlışı renk/kontrast bozulmasına yol açar
+            vae = AutoencoderKL.from_single_file(
+                vae_path, config=SDXL_HF_ID, subfolder="vae", torch_dtype=self.dtype
+            ).to(self.device)
         else:
             logger.info(f"VAE local file not found, loading from HuggingFace: {SDXL_HF_ID}")
             vae = AutoencoderKL.from_pretrained(
@@ -132,6 +153,10 @@ class VideoGenerator:
             scheduler=scheduler,
         )
         self.pipeline.to(self.device)
+
+        gen_cfg = self.config.get("model", {}).get("generation", {})
+        self.pipeline.flow_blend_end = float(gen_cfg.get("flow_blend_end", 1.0))
+        logger.info(f"P-kare akış harmanlaması: adımların ilk %{self.pipeline.flow_blend_end * 100:.0f}'inde aktif.")
 
         if self.config.get("runtime", {}).get("enable_model_cpu_offload", False):
             self.pipeline.enable_model_cpu_offload()
@@ -186,6 +211,13 @@ class VideoGenerator:
             logger.info("ControlNet config'de devre dışı bırakılmış.")
 
         logger.info("✅ Models loaded successfully")
+
+    def _text_encoders_to(self, device):
+        """Metin kodlayıcılar (~1,6 GB) sadece prompt kodlanırken GPU'da dursun; sonra RAM'e."""
+        self.text_encoder.to(device)
+        self.text_encoder_2.to(device)
+        if str(device) == "cpu":
+            flush_vram()
 
     # --------------------------------------------------------
     # PROMPT ENCODING (SDXL Dual Text Encoder)
@@ -275,6 +307,7 @@ class VideoGenerator:
         reference_image_path: Optional[str] = None,  # I2V: tek referans fotoğraf
         ip_adapter_scale: float = 0.0,
         control_video_path: Optional[str] = None,  # ControlNet: hareket kaynağı (pose/depth dizisi)
+        prompt_end: Optional[str] = None,  # Son karenin prompt'u: ilk → son arası SLERP ile geçiş
     ) -> str:
         generator = (
             torch.Generator(device=self.device).manual_seed(seed)
@@ -283,12 +316,38 @@ class VideoGenerator:
         )
 
         logger.info("🔤 Encoding prompt...")
+        self._text_encoders_to(self.device)
         prompt_embeds, added_cond_kwargs = self._encode_prompt(
             prompt=prompt,
             negative_prompt=negative_prompt,
             width=width,
             height=height,
         )
+
+        # Prompt geçişi: ilk kare `prompt`, son kare `prompt_end`, aradakiler SLERP (PromptBlender)
+        if prompt_end and num_frames > 1:
+            end_embeds, end_added = self._encode_prompt(
+                prompt=prompt_end,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+            )
+            prompt_embeds, added_cond_kwargs = PromptBlender.interpolate_embedding_schedule(
+                keyframe_indices=[0, num_frames - 1],
+                keyframe_prompt_embeds=[prompt_embeds, end_embeds],
+                keyframe_added_cond=[added_cond_kwargs, end_added],
+                num_frames=num_frames,
+            )
+            logger.info(f"🔀 Prompt geçişi aktif: {num_frames} kare boyunca → '{prompt_end}'")
+            if self.pipeline.flow_blend_end >= 1.0:
+                logger.warning(
+                    "⚠️ flow_blend_end=1.0: P-kareler önceki kareyi neredeyse kopyalar, prompt geçişi "
+                    "görünmeyebilir. configs/sdxl_video.yaml → flow_blend_end: 0.6 deneyin."
+                )
+
+        # Kodlama bitti: metin kodlayıcıları GPU'dan çıkar (UNet'e ~1,6 GB VRAM açılır)
+        self._text_encoders_to("cpu")
+        logger.info("Metin kodlayıcılar RAM'e taşındı (VRAM boşaltıldı).")
 
         # --------------------------------------------------------
         # --------------------------------------------------------

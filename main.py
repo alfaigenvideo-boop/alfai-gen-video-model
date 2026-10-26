@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import logging
+import re
 import yaml
 
 # Proje ana dizinini Python yoluna ekle
@@ -15,6 +16,42 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Main")
 
 CONFIG_DIR_NAME = "configs"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_REF = re.compile(r"\$\{([^}]+)\}")
+
+
+def _lookup(config: dict, dotted: str):
+    node = config
+    for key in dotted.split("."):
+        node = node[key]
+    return node
+
+
+def _resolve_refs(node, config: dict):
+    """YAML ${a.b} referanslarını çözer (yaml.safe_load bunu kendisi yapmaz)."""
+    if isinstance(node, dict):
+        return {k: _resolve_refs(v, config) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_resolve_refs(v, config) for v in node]
+    if isinstance(node, str):
+        return _REF.sub(lambda m: str(_lookup(config, m.group(1))), node)
+    return node
+
+
+def _resolve_base_dir(config: dict):
+    """base_dir göreliyse proje köküne göre çözülür; bu makinede yoksa proje kökü kullanılır."""
+    paths = config.get("paths", {})
+    base = paths.get("base_dir")
+    if not base:
+        paths["base_dir"] = PROJECT_ROOT
+        return
+    if not os.path.isabs(base):
+        base = os.path.join(PROJECT_ROOT, base)
+    if not os.path.isdir(base):
+        logger.warning(f"paths.base_dir bu makinede yok ({base}) → proje kökü kullanılıyor: {PROJECT_ROOT}")
+        base = PROJECT_ROOT
+    paths["base_dir"] = os.path.normpath(base)
+
 
 def load_config() -> dict:
     """YAML konfigürasyon dosyalarını okur ve birleştirerek tek bir dict döner."""
@@ -26,7 +63,8 @@ def load_config() -> dict:
             part = yaml.safe_load(f)
             if part:
                 config.update(part)
-    return config
+    _resolve_base_dir(config)
+    return _resolve_refs(config, config)
 
 def main():
     parser = argparse.ArgumentParser(description="SDXL Video Generation Pipeline")
@@ -37,6 +75,8 @@ def main():
                         help="[I2V Modu] Referans fotoğraf yolu. Verilirse flow anchor olarak kullanılır.")
     parser.add_argument("-c", "--control-video", type=str, default=None,
                         help="[ControlNet] Hareket kaynağı video (pose/depth haritaları her kare için buradan çıkarılır).")
+    parser.add_argument("--prompt-end", type=str, default=None,
+                        help="Son karenin prompt'u. Verilirse ilk kareden son kareye prompt yumuşakça geçer.")
     parser.add_argument("--fast", action="store_true",
                         help="Hızlı test modu: 4 kare, 5 adım, 512x512 — yaklaşık 2-3 dakika")
     parser.add_argument("--steps", type=int, default=None,
@@ -77,6 +117,7 @@ def main():
         seed=config.get("runtime", {}).get("seed", None),
         reference_image_path=args.ref,
         control_video_path=args.control_video,
+        prompt_end=args.prompt_end,
     )
 
     logger.info(f"✅ Video başarıyla kaydedildi: {output_path}")
@@ -84,4 +125,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
